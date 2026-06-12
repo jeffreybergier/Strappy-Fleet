@@ -7,6 +7,7 @@ import { infoCommand } from "./commands/info.js";
 import { listCommand } from "./commands/list.js";
 import { statusCommand } from "./commands/status.js";
 import { syncCommand } from "./commands/sync.js";
+import { runTui } from "./tui.js";
 
 const program = new Command();
 
@@ -70,11 +71,14 @@ program
     await statusCommand(opts);
   });
 
-// Default command (bare `strappy`) — the interactive TUI is Milestone 4; for
-// now, surface status and point at the available commands.
 program.action(async () => {
+  if (process.stdin.isTTY && process.stdout.isTTY) {
+    await runTui();
+    return;
+  }
+
   await statusCommand({});
-  console.log("\nCommands: auth · sync · enrich · list · info · status   (try `strappy --help`)");
+  console.log("\nNon-interactive shell detected. Run `strappy` in a TTY for the interactive UI.");
 });
 
 program.parseAsync(process.argv).catch((err: unknown) => {

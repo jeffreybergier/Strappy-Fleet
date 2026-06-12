@@ -31,8 +31,10 @@ backup is real once you've run a sync.
 - The GitHub token is resolved from env / `secrets/github-token` / `gh` and is
   **never written into a mirror's git config**.
 
-Not in M1 yet: the daemon (`M2`), ephemeral checkouts + relay push (`M3`), the
-interactive TUI (`M4`), and pi integration (`M5`).
+Also present now: a first-pass interactive TUI shell for the dashboard, repo
+search/actions, checkout placeholder, audit placeholder, ask placeholder, and
+settings. The daemon (`M2`), real ephemeral checkouts + relay push (`M3`), full
+TUI-backed checkout workflows, audits, and pi integration are still future work.
 
 ## Setup
 
@@ -56,6 +58,7 @@ Provide the token in any of these ways (checked in this order):
 Run with `npm run strappy -- <args>` (dev), or `npm run build && strappy <args>`.
 
 ```bash
+npm run strappy --                     # interactive TUI when run in a TTY
 npm run strappy -- auth --check        # which token would be used?
 npm run strappy -- sync                # mirror everything (+ Tier-1 metadata)
 npm run strappy -- sync owner/repo     # mirror just one

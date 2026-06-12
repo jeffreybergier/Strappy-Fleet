@@ -6,6 +6,8 @@ export interface StrappyConfig {
   owners: string[];
   /** Whether configured `owners` that are orgs should be enumerated as orgs. */
   includeOrgs: boolean;
+  /** Directory where disposable working copies are created. Null means auto. */
+  checkoutRoot: string | null;
   /** Cron expression used by the daemon (Milestone 2); stored now for forward-compat. */
   schedule: string;
   /** How many repos to sync in parallel. */
@@ -19,6 +21,7 @@ export interface StrappyConfig {
 export const DEFAULT_CONFIG: StrappyConfig = {
   owners: [],
   includeOrgs: false,
+  checkoutRoot: null,
   schedule: "0 */6 * * *",
   concurrency: 4,
   freshnessMinutes: 6 * 60,
