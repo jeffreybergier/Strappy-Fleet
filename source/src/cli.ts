@@ -33,7 +33,7 @@ program
 
 program
   .command("sync")
-  .description("Refresh inventory and mirror all repos (or just the named ones)")
+  .description("Refresh inventory, mirrors, and stale enrichment for all repos (or just the named ones)")
   .argument("[repos...]", 'repos to sync, e.g. "owner/name" or "name"')
   .action(async (repos: string[]) => {
     await syncCommand(repos);

@@ -1,5 +1,6 @@
 import { resolveToken } from "../auth.js";
 import { loadConfig } from "../config.js";
+import { enrich } from "../enrich.js";
 import { humanSize } from "../format.js";
 import { openStore } from "../db.js";
 import { Logger } from "../logger.js";
@@ -50,4 +51,31 @@ export async function syncCommand(repos: string[]): Promise<void> {
   console.log(`Result: ${summary.ok} ok, ${summary.failed} failed.`);
 
   if (summary.failed > 0) process.exitCode = 1;
+
+  console.log("");
+  console.log("Refreshing stale enrichment:");
+  const enrichment = await enrich({
+    store,
+    config,
+    token: resolved.token,
+    logger,
+    only: repos.length ? repos : undefined,
+  });
+
+  if (enrichment.results.length === 0) {
+    console.log(
+      enrichment.skipped > 0
+        ? `All ${enrichment.skipped} repo(s) already fresh (within ${config.enrichmentMaxAgeDays}d). Use \`strappy enrich --force\` to refetch.`
+        : "No repos in inventory.",
+    );
+  } else {
+    console.log(
+      `Enriched ${enrichment.ok} repo(s), ${enrichment.failed} failed, ${enrichment.skipped} fresh.`,
+    );
+    for (const r of enrichment.results.filter((x) => !x.ok)) {
+      console.log(`  ✗ ${r.fullName}: ${r.error}`);
+    }
+  }
+
+  if (enrichment.failed > 0) process.exitCode = 1;
 }

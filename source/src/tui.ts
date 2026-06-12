@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import * as readline from "node:readline";
-import { confirm, input, search, select } from "@inquirer/prompts";
-import { resolveToken } from "./auth.js";
+import { confirm, input, search, select, Separator } from "@inquirer/prompts";
+import { execa } from "execa";
+import { resolveToken, type ResolvedToken, type TokenSource } from "./auth.js";
 import {
   checkoutStatus,
   cleanupCheckouts,
@@ -11,37 +13,20 @@ import {
   scanCheckouts,
   unsafeReason,
 } from "./checkouts.js";
-import { authCheck } from "./commands/auth.js";
-import { enrichCommand } from "./commands/enrich.js";
-import { infoCommand } from "./commands/info.js";
-import { statusCommand } from "./commands/status.js";
 import { syncCommand } from "./commands/sync.js";
 import { loadConfig, type StrappyConfig } from "./config.js";
 import { openStore } from "./db.js";
 import { humanSize, timeAgo } from "./format.js";
-import { getPaths, type Paths } from "./paths.js";
+import { makeOctokit, whoami } from "./github.js";
+import { getPaths, splitFullName, type Paths } from "./paths.js";
 import type { CheckoutRecord, RepoRecord, StrappyState } from "./state.js";
 
 type MainAction =
-  | "dashboard"
   | "sync"
-  | "enrich"
-  | "checkouts"
-  | "audits"
-  | "settings"
-  | "quit";
+  | "checkout"
+  | `checkout:${string}`;
 
-type RepoAction =
-  | "summary"
-  | "info"
-  | "sync"
-  | "enrich"
-  | "github"
-  | "checkout";
-
-type SettingsAction = "auth" | "status";
-type CheckoutsAction = "create" | "select" | "scan" | "cleanup";
-type CheckoutDetailAction = "scan" | "cleanup" | "forceCleanup" | "path";
+type CheckoutWorkAction = "diff" | "commit" | "push";
 
 interface Choice<Value> {
   value: Value;
@@ -56,55 +41,68 @@ interface TuiContext {
   config: StrappyConfig;
   checkoutRoot: string;
   state: StrappyState;
-  tokenSource: string | null;
+  auth: AuthDashboardStatus;
+}
+
+interface AuthDashboardStatus {
+  label: string;
+  detail?: string;
+  attention?: string;
 }
 
 const ESCAPE_ABORT_REASON = "strappy:escape-back";
+const DASHBOARD_REFRESH_ABORT_REASON = "strappy:dashboard-refresh";
+const DASHBOARD_REFRESH_MS = 60_000;
+const AUTH_STATUS_CACHE_MS = 5 * 60_000;
+const AUTH_STATUS_TIMEOUT_MS = 2_500;
+const MENU_PROMPT_THEME = {
+  prefix: "",
+  style: {
+    disabled: (text: string) => color.dim(`  ${text}`),
+  },
+};
 const BACK_INSTRUCTIONS = {
   navigation: "↑↓ navigate • ⏎ select • ␛ back",
   pager: "↑↓ navigate • ⏎ select • ␛ back",
 };
+let authStatusCache: { key: string; checkedAt: number; status: AuthDashboardStatus } | null = null;
 
 class BackSignal extends Error {
   override name = "BackSignal";
 }
 
+class DashboardRefreshSignal extends Error {
+  override name = "DashboardRefreshSignal";
+}
+
+class TimeoutError extends Error {
+  override name = "TimeoutError";
+}
+
 export async function runTui(): Promise<void> {
   try {
     await ensureCheckoutRoot();
-    await showDashboard();
 
     while (true) {
+      await showDashboard();
+      const checkouts = await scanCheckoutEntries();
+
       let action: MainAction;
       try {
         action = await selectPrompt<MainAction>({
-          message: "Strappy",
-          pageSize: 10,
-          choices: [
-            { value: "dashboard", name: "Dashboard", description: "Fleet health summary" },
-            { value: "sync", name: "Sync now", description: "Refresh GitHub inventory and mirrors" },
-            { value: "enrich", name: "Enrich stale repos", description: "Fetch languages, branches, releases, README" },
-            { value: "checkouts", name: "Checkouts", description: "Create, scan, and cleanup working copies" },
-            { value: "audits", name: "Audits", description: "Planned GitHub posture findings" },
-            { value: "settings", name: "Settings", description: "Paths, auth, and config" },
-            { value: "quit", name: "Quit" },
-          ],
-        });
+          message: "Menu",
+          pageSize: menuPageSize(),
+          choices: mainMenuChoices(checkouts),
+        }, { refreshMs: DASHBOARD_REFRESH_MS });
       } catch (err) {
+        if (isDashboardRefreshSignal(err)) continue;
         if (isBackSignal(err)) return;
         throw err;
       }
 
-      if (action === "quit") return;
-      if (action === "dashboard") await showDashboard();
-      else if (action === "sync") await runCommand("Sync now", () => syncCommand([]));
-      else if (action === "enrich") await runCommand("Enrich stale repos", () => enrichCommand([], {}));
-      else if (action === "checkouts") await checkoutsView();
-      else if (action === "audits") await plannedView("Audits", [
-        "This view will store durable findings for branch protection, collaborators, Actions, security, and hygiene.",
-        "Next implementation step after checkouts: `strappy audit`, `strappy findings`, and an audit findings table.",
-      ]);
-      else if (action === "settings") await settingsView();
+      if (action === "sync") await runCommand("Sync", () => syncCommand([]));
+      else if (action === "checkout") await repoCheckoutSearchView();
+      else if (action.startsWith("checkout:")) await handleCheckoutSelection(action.slice("checkout:".length));
     }
   } catch (err) {
     if (isPromptExit(err)) return;
@@ -121,42 +119,37 @@ async function showDashboard(): Promise<void> {
   const totalKb = repos.reduce((sum, r) => sum + (r.sizeKb ?? 0), 0);
 
   clear();
-  title("STRAPPY");
-  console.log(`Checkout root  ${ctx.checkoutRoot}`);
-  console.log(`STRAPPY_HOME   ${ctx.paths.home}`);
-  console.log(`Token          ${ctx.tokenSource ?? "none - run `strappy auth`"}`);
-  console.log(`Last sync      ${timeAgo(ctx.state.lastInventoryAt)}`);
-  console.log(`Mirrors        ${repos.length} (${humanSize(totalKb)})`);
-  console.log(`Failures       ${failures.length}`);
-  console.log(`Orphaned       ${orphaned.length}`);
-  console.log(`Checkouts      ${checkouts.length}`);
+  console.log(color.bold("STRAPPY"));
+  console.log(color.dim(`Live fleet dashboard • refreshed ${clock(new Date())} • auto ${DASHBOARD_REFRESH_MS / 1000}s`));
+  console.log(rule());
+  dashboardRow("Mirrors", `${repos.length} (${humanSize(totalKb)})`);
+  dashboardRow("Last sync", timeAgo(ctx.state.lastInventoryAt));
+  dashboardRow("Checkouts", String(checkouts.length));
+  dashboardRow("Auth", authSummary(ctx.auth));
+  dashboardRow("Failures", String(failures.length));
+  dashboardRow("Orphaned", String(orphaned.length));
+  console.log("");
+  console.log(color.dim(`Checkout root  ${ctx.checkoutRoot}`));
+  console.log(color.dim(`STRAPPY_HOME   ${ctx.paths.home}`));
   console.log("");
 
   const needsAttention = [
-    ctx.tokenSource ? null : "danger  No GitHub token configured",
+    ctx.auth.attention ?? null,
     failures.length ? `danger  ${failures.length} mirror sync failure(s)` : null,
     orphaned.length ? `warn    ${orphaned.length} orphaned mirror(s) kept locally` : null,
-    repos.length === 0 ? "info    No repo inventory yet; run Sync now" : null,
-    checkouts.length === 0 ? "info    No registered checkouts yet" : null,
+    repos.length === 0 ? "info    No repo inventory yet; run Sync" : null,
+    checkouts.length === 0 ? "info    No checkouts yet" : null,
   ].filter((line): line is string => line !== null);
 
-  console.log("Needs Attention");
+  section("Needs Attention");
   if (needsAttention.length === 0) console.log("  none");
-  else for (const line of needsAttention) console.log(`  ${line}`);
+  else for (const line of needsAttention) console.log(`  ${attentionLine(line)}`);
 
   if (failures.length) {
     console.log("");
-    console.log("Recent Failures");
+    section("Recent Failures");
     for (const repo of failures.slice(0, 5)) {
       console.log(`  ${repo.fullName}: ${repo.lastError ?? "unknown error"}`);
-    }
-  }
-
-  if (checkouts.length) {
-    console.log("");
-    console.log("Registered Checkouts");
-    for (const [name, checkout] of checkouts.slice(0, 5)) {
-      console.log(`  ${name.padEnd(18)} ${checkout.repo.padEnd(32)} ${checkout.branch.padEnd(16)} ${checkout.path}`);
     }
   }
 
@@ -166,12 +159,12 @@ async function showDashboard(): Promise<void> {
 async function repoCheckoutSearchView(): Promise<void> {
   while (true) {
     const ctx = await loadTuiContext();
-    const records = Object.values(ctx.state.repos).sort((a, b) => a.fullName.localeCompare(b.fullName));
+    const records = Object.values(ctx.state.repos).sort(compareReposForCheckout);
 
     clear();
     title("Choose Repo");
     if (records.length === 0) {
-      console.log("No repos in inventory. Run Sync now first.");
+      console.log("No repos in inventory. Run Sync first.");
       await pause();
       return;
     }
@@ -188,169 +181,8 @@ async function repoCheckoutSearchView(): Promise<void> {
       throw err;
     }
 
-    const next = await repoActions(selection);
-    if (next === "checkoutCreated") return;
+    if (await createCheckoutFlow(selection)) return;
   }
-}
-
-async function repoActions(repo: RepoRecord): Promise<"search" | "checkoutCreated"> {
-  while (true) {
-    clear();
-    printRepoSummary(repo);
-    console.log("");
-
-    let action: RepoAction;
-    try {
-      action = await selectPrompt<RepoAction>({
-        message: "Repo action",
-        choices: [
-          { value: "summary", name: "Refresh summary" },
-          { value: "info", name: "Show full info", description: "`strappy info` output" },
-          { value: "sync", name: "Sync this repo" },
-          { value: "enrich", name: "Enrich this repo" },
-          { value: "github", name: "Show GitHub URL" },
-          { value: "checkout", name: "Create checkout" },
-        ],
-      });
-    } catch (err) {
-      if (isBackSignal(err)) return "search";
-      throw err;
-    }
-
-    if (action === "summary") {
-      const refreshed = await findRepo(repo.fullName);
-      if (refreshed) repo = refreshed;
-      continue;
-    }
-    if (action === "info") await runCommand(`Info: ${repo.fullName}`, () => infoCommand(repo.fullName, {}));
-    else if (action === "sync") await runCommand(`Sync: ${repo.fullName}`, () => syncCommand([repo.fullName]));
-    else if (action === "enrich") await runCommand(`Enrich: ${repo.fullName}`, () => enrichCommand([repo.fullName], {}));
-    else if (action === "checkout") {
-      if (await createCheckoutFlow(repo)) return "checkoutCreated";
-      continue;
-    }
-    else if (action === "github") {
-      console.log("");
-      console.log(repo.metadata?.htmlUrl ?? `https://github.com/${repo.fullName}`);
-      await pause();
-    }
-
-    const refreshed = await findRepo(repo.fullName);
-    if (refreshed) repo = refreshed;
-  }
-}
-
-async function checkoutsView(): Promise<void> {
-  while (true) {
-    const ctx = await loadTuiContext();
-    const checkouts = Object.entries(ctx.state.checkouts).sort((a, b) => a[0].localeCompare(b[0]));
-
-    clear();
-    title("Checkouts");
-    console.log(`Root  ${ctx.checkoutRoot}`);
-    console.log("");
-
-    if (checkouts.length === 0) {
-      console.log("No registered checkouts yet.");
-    } else {
-      console.log("name               repo                             branch           status                 path");
-      for (const [name, checkout] of checkouts) printCheckout(name, checkout);
-    }
-
-    console.log("");
-    let action: CheckoutsAction;
-    try {
-      action = await selectPrompt<CheckoutsAction>({
-        message: "Checkout action",
-        choices: [
-          { value: "create", name: "Create checkout", description: "Search repos, inspect details, then clone from mirror" },
-          {
-            value: "select",
-            name: "Select checkout",
-            description: "Inspect, scan, or cleanup one checkout",
-            disabled: checkouts.length === 0 ? "No registered checkouts" : false,
-          },
-          {
-            value: "scan",
-            name: "Scan all",
-            description: "Refresh dirty/unpushed status",
-            disabled: checkouts.length === 0 ? "No registered checkouts" : false,
-          },
-          {
-            value: "cleanup",
-            name: "Cleanup all safe",
-            description: "Deletes only checkouts with no dirty or unpushed work",
-            disabled: checkouts.length === 0 ? "No registered checkouts" : false,
-          },
-        ],
-      });
-    } catch (err) {
-      if (isBackSignal(err)) return;
-      throw err;
-    }
-
-    if (action === "create") await repoCheckoutSearchView();
-    else if (action === "scan") await runCommand("Scan checkouts", async () => {
-      const store = openStore(getPaths());
-      const scanned = await scanCheckouts(store);
-      for (const [name, checkout] of Object.entries(scanned)) {
-        console.log(`${name}: ${checkoutStatus(checkout)}`);
-      }
-      if (Object.keys(scanned).length === 0) console.log("No registered checkouts.");
-    });
-    else if (action === "cleanup") await runCommand("Cleanup safe checkouts", async () => {
-      const store = openStore(getPaths());
-      const result = await cleanupCheckouts(store, { all: true });
-      printCleanupResult(result);
-    });
-    else if (action === "select") await checkoutDetailFlow();
-  }
-}
-
-async function settingsView(): Promise<void> {
-  while (true) {
-    const ctx = await loadTuiContext();
-
-    clear();
-    title("Settings");
-    console.log(`STRAPPY_HOME       ${ctx.paths.home}`);
-    console.log(`Checkout root      ${ctx.checkoutRoot}`);
-    console.log(`Config             ${ctx.paths.config}`);
-    console.log(`Database           ${ctx.paths.db}`);
-    console.log(`Token              ${ctx.tokenSource ?? "none"}`);
-    console.log(`Owners             ${ctx.config.owners.length ? ctx.config.owners.join(", ") : "(none)"}`);
-    console.log(`Include orgs       ${ctx.config.includeOrgs}`);
-    console.log(`Concurrency        ${ctx.config.concurrency}`);
-    console.log(`Freshness          ${ctx.config.freshnessMinutes} minutes`);
-    console.log(`Enrichment max age ${ctx.config.enrichmentMaxAgeDays} days`);
-    console.log(`Schedule           ${ctx.config.schedule}`);
-    console.log("");
-
-    let action: SettingsAction;
-    try {
-      action = await selectPrompt<SettingsAction>({
-        message: "Settings action",
-        choices: [
-          { value: "auth", name: "Check GitHub auth" },
-          { value: "status", name: "Print status" },
-        ],
-      });
-    } catch (err) {
-      if (isBackSignal(err)) return;
-      throw err;
-    }
-
-    if (action === "auth") await runCommand("GitHub auth", () => authCheck());
-    else if (action === "status") await runCommand("Status", () => statusCommand({}));
-  }
-}
-
-async function plannedView(name: string, lines: string[]): Promise<void> {
-  clear();
-  title(name);
-  for (const line of lines) console.log(line);
-  console.log("");
-  await pause();
 }
 
 async function runCommand(label: string, fn: () => Promise<void>): Promise<void> {
@@ -376,14 +208,95 @@ async function loadTuiContext(): Promise<TuiContext> {
   const checkoutRoot = resolveCheckoutRoot(paths, config);
   const store = openStore(paths);
   const state = await store.read();
-  const resolved = await resolveToken(paths);
+  const auth = await dashboardAuthStatus(paths);
   return {
     paths,
     config,
     checkoutRoot,
     state,
-    tokenSource: resolved?.source ?? null,
+    auth,
   };
+}
+
+async function dashboardAuthStatus(paths: Paths): Promise<AuthDashboardStatus> {
+  const resolved = await resolveToken(paths);
+  if (!resolved) {
+    return {
+      label: color.danger("not signed in"),
+      detail: "run `strappy auth`",
+      attention: "danger  GitHub auth is not configured",
+    };
+  }
+
+  const key = authCacheKey(resolved);
+  const now = Date.now();
+  if (authStatusCache?.key === key && now - authStatusCache.checkedAt < AUTH_STATUS_CACHE_MS) {
+    return authStatusCache.status;
+  }
+
+  const status = await checkAuth(resolved);
+  authStatusCache = { key, checkedAt: now, status };
+  return status;
+}
+
+async function checkAuth(resolved: ResolvedToken): Promise<AuthDashboardStatus> {
+  try {
+    const login = await withTimeout(whoami(makeOctokit(resolved.token)), AUTH_STATUS_TIMEOUT_MS);
+    return {
+      label: color.info(`@${login}`),
+      detail: tokenSourceLabel(resolved.source),
+    };
+  } catch (err) {
+    if (err instanceof TimeoutError) {
+      return {
+        label: "configured",
+        detail: `${tokenSourceLabel(resolved.source)}, check timed out`,
+      };
+    }
+
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      label: color.danger("invalid"),
+      detail: tokenSourceLabel(resolved.source),
+      attention: `danger  GitHub auth failed: ${message}`,
+    };
+  }
+}
+
+async function withTimeout<Value>(promise: Promise<Value>, ms: number): Promise<Value> {
+  let timer: NodeJS.Timeout | null = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<Value>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new TimeoutError(`Timed out after ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function authCacheKey(resolved: ResolvedToken): string {
+  const fingerprint = createHash("sha256").update(resolved.token).digest("hex");
+  return `${resolved.source}:${fingerprint}`;
+}
+
+function authSummary(status: AuthDashboardStatus): string {
+  return status.detail ? `${status.label} (${status.detail})` : status.label;
+}
+
+function tokenSourceLabel(source: TokenSource): string {
+  switch (source) {
+    case "env:STRAPPY_GITHUB_TOKEN":
+      return "STRAPPY_GITHUB_TOKEN";
+    case "env:GITHUB_TOKEN":
+      return "GITHUB_TOKEN";
+    case "file":
+      return "saved token";
+    case "gh-cli":
+      return "GitHub CLI";
+  }
 }
 
 async function ensureCheckoutRoot(): Promise<void> {
@@ -392,32 +305,137 @@ async function ensureCheckoutRoot(): Promise<void> {
   await fs.mkdir(resolveCheckoutRoot(paths, config), { recursive: true });
 }
 
+async function scanCheckoutEntries(): Promise<[string, CheckoutRecord][]> {
+  const store = openStore(getPaths());
+  const scanned = await scanCheckouts(store);
+  return Object.entries(scanned).sort((a, b) => a[0].localeCompare(b[0]));
+}
+
+function mainMenuChoices(checkouts: [string, CheckoutRecord][]): Array<Choice<MainAction> | Separator> {
+  const choices: Array<Choice<MainAction> | Separator> = [
+    menuSection("Actions"),
+    { value: "sync", name: "Sync", description: "Inventory, mirrors, stale metadata" },
+    { value: "checkout", name: "Checkout", description: "New working copy" },
+    menuSection(checkouts.length ? "Checkouts" : "Checkouts (none)"),
+  ];
+
+  choices.push(...checkouts.map(([name, checkout]) => checkoutChoice(name, checkout)));
+  return choices;
+}
+
+function menuSection(text: string): Separator {
+  return new Separator(color.dim(text));
+}
+
+function menuPageSize(): number {
+  return Math.max(10, Math.min(20, (process.stdout.rows ?? 24) - 8));
+}
+
 function repoChoices(records: RepoRecord[], term: string | undefined): Choice<RepoRecord>[] {
   const needle = term?.trim().toLowerCase() ?? "";
   const filtered = needle
     ? records.filter((repo) => repoSearchText(repo).includes(needle))
     : records;
+  const visible = filtered.sort(compareReposForCheckout).slice(0, 50);
+  const layout = repoListLayout(hasSingleOwner(visible));
 
-  return filtered.slice(0, 50).map((repo) => ({
+  return visible.map((repo) => ({
     value: repo,
-    name: repoListLine(repo),
+    name: repoListLine(repo, layout),
     description: repo.metadata?.description ?? undefined,
     short: repo.fullName,
   }));
 }
 
-function repoListLine(repo: RepoRecord): string {
-  const language = repo.metadata?.language ?? "-";
-  const pushed = timeAgo(repo.metadata?.pushedAt ?? repo.lastSync);
-  const flags = [
+interface RepoListLayout {
+  nameWidth: number;
+  languageWidth: number;
+  ageWidth: number;
+  visibilityWidth: number;
+  statusWidth: number;
+  hideOwner: boolean;
+}
+
+function repoListLayout(hideOwner: boolean): RepoListLayout {
+  const languageWidth = 12;
+  const ageWidth = 10;
+  const visibilityWidth = 7;
+  const minNameWidth = 18;
+  const desiredStatusWidth = 16;
+  const minStatusWidth = 8;
+  const gapsWidth = 8;
+  const rowWidth = Math.max(52, screenWidth() - 3);
+  let statusWidth = desiredStatusWidth;
+  let nameWidth = rowWidth - languageWidth - ageWidth - visibilityWidth - statusWidth - gapsWidth;
+
+  if (nameWidth < minNameWidth) {
+    statusWidth = Math.max(minStatusWidth, rowWidth - languageWidth - ageWidth - visibilityWidth - minNameWidth - gapsWidth);
+    nameWidth = rowWidth - languageWidth - ageWidth - visibilityWidth - statusWidth - gapsWidth;
+  }
+
+  return {
+    nameWidth: Math.max(minNameWidth, nameWidth),
+    languageWidth,
+    ageWidth,
+    visibilityWidth,
+    statusWidth,
+    hideOwner,
+  };
+}
+
+function repoListLine(repo: RepoRecord, layout: RepoListLayout): string {
+  const language = fitText(repo.metadata?.language ?? "-", layout.languageWidth);
+  const pushed = fitText(timeAgo(repoActivityIso(repo)), layout.ageWidth);
+  const visibility = repo.private ? "private" : "public";
+  const status = [
     repo.lastSyncOk === false ? "FAIL" : null,
     repo.orphaned ? "orphaned" : null,
     repo.archived ? "archived" : null,
-    repo.private ? "private" : null,
   ]
     .filter(Boolean)
-    .join(",");
-  return `${repo.fullName.padEnd(38)} ${language.padEnd(12)} ${pushed.padStart(8)} ${flags}`;
+    .join(" ");
+  return (
+    `${fitText(repoDisplayName(repo, layout.hideOwner), layout.nameWidth).padEnd(layout.nameWidth)}  ` +
+    `${language.padEnd(layout.languageWidth)}  ` +
+    `${pushed.padStart(layout.ageWidth)}  ` +
+    `${visibility.padEnd(layout.visibilityWidth)}  ` +
+    fitText(status, layout.statusWidth)
+  );
+}
+
+function hasSingleOwner(repos: RepoRecord[]): boolean {
+  if (repos.length === 0) return true;
+  const firstOwner = repoOwner(repos[0]);
+  return repos.every((repo) => repoOwner(repo) === firstOwner);
+}
+
+function repoDisplayName(repo: RepoRecord, hideOwner: boolean): string {
+  return hideOwner ? splitFullName(repo.fullName)[1] : repo.fullName;
+}
+
+function repoOwner(repo: RepoRecord): string {
+  return splitFullName(repo.fullName)[0];
+}
+
+function compareReposForCheckout(a: RepoRecord, b: RepoRecord): number {
+  const archived = Number(a.archived) - Number(b.archived);
+  if (archived !== 0) return archived;
+
+  const activity = repoActivityMs(b) - repoActivityMs(a);
+  if (activity !== 0) return activity;
+
+  return a.fullName.localeCompare(b.fullName);
+}
+
+function repoActivityIso(repo: RepoRecord): string | null {
+  return repo.metadata?.pushedAt ?? repo.lastSync;
+}
+
+function repoActivityMs(repo: RepoRecord): number {
+  const iso = repoActivityIso(repo);
+  if (!iso) return Number.NEGATIVE_INFINITY;
+  const parsed = Date.parse(iso);
+  return Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
 }
 
 function repoSearchText(repo: RepoRecord): string {
@@ -433,188 +451,217 @@ function repoSearchText(repo: RepoRecord): string {
     .toLowerCase();
 }
 
-function printRepoSummary(repo: RepoRecord): void {
-  title(repo.fullName);
-  const metadata = repo.metadata;
-  if (metadata?.description) console.log(metadata.description);
-  console.log("");
-  console.log(`Mirror       ${repo.lastSyncOk === false ? "failed" : repo.lastSync ? "synced" : "never"} (${timeAgo(repo.lastSync)})`);
-  console.log(`Size         ${humanSize(repo.sizeKb)}`);
-  console.log(`Visibility   ${metadata?.visibility ?? (repo.private ? "private" : "public")}`);
-  console.log(`Default      ${repo.defaultBranch}`);
-  console.log(`Language     ${metadata?.language ?? "-"}`);
-  console.log(`Last push    ${timeAgo(metadata?.pushedAt ?? null)}`);
-  console.log(`Flags        ${repoFlags(repo).join(", ") || "-"}`);
-  if (metadata?.topics.length) console.log(`Topics       ${metadata.topics.join(", ")}`);
-  if (repo.enrichment) console.log(`Enrichment   fetched ${timeAgo(repo.enrichment.fetchedAt)}`);
-  else console.log("Enrichment   none");
+function checkoutChoice(name: string, checkout: CheckoutRecord): Choice<MainAction> {
+  return {
+    value: `checkout:${name}`,
+    name: checkoutMenuLine(name, checkout),
+    description: `${checkout.repo}  ${checkout.path}`,
+    short: name,
+  };
 }
 
-function repoFlags(repo: RepoRecord): string[] {
-  return [
-    repo.private ? "private" : null,
-    repo.archived ? "archived" : null,
-    repo.orphaned ? "orphaned" : null,
-    repo.metadata?.fork ? "fork" : null,
-    repo.metadata?.isTemplate ? "template" : null,
-  ].filter((flag): flag is string => flag !== null);
+function checkoutMenuLine(name: string, checkout: CheckoutRecord): string {
+  const status = checkoutStatusLabel(checkout);
+  const branch = fitText(checkout.currentBranch ?? checkout.branch, 14);
+  const nameWidth = Math.max(18, screenWidth() - 38);
+  return `${fitText(name, nameWidth).padEnd(nameWidth)}  ${status.padEnd(12)}  ${branch}`;
 }
 
-async function findRepo(fullName: string): Promise<RepoRecord | null> {
-  const ctx = await loadTuiContext();
-  return ctx.state.repos[fullName] ?? null;
+function checkoutStatusLabel(checkout: CheckoutRecord): string {
+  if (checkout.exists === false) return "missing";
+  if (checkout.scanError) return "warning";
+  if (checkout.dirty && (checkout.ahead ?? 0) > 0) return "dirty+push";
+  if (checkout.dirty) return "dirty";
+  if ((checkout.ahead ?? 0) > 0) return `${checkout.ahead} unpushed`;
+  if ((checkout.behind ?? 0) > 0) return `${checkout.behind} behind`;
+  return "clean";
 }
 
-function printCheckout(name: string, checkout: CheckoutRecord): void {
-  const branch = checkout.currentBranch ?? checkout.branch;
-  const status = checkoutStatus(checkout);
-  console.log(
-    `${name.padEnd(18)} ${checkout.repo.padEnd(32)} ${branch.padEnd(16)} ` +
-      `${status.padEnd(22)} ${checkout.path}`,
-  );
+function fitText(value: string, width: number): string {
+  if (value.length <= width) return value;
+  if (width <= 3) return value.slice(0, width);
+  return `${value.slice(0, width - 3)}...`;
 }
 
 async function createCheckoutFlow(repo: RepoRecord): Promise<boolean> {
-  let branch: string;
-  let name: string;
-  try {
-    branch = await inputPrompt({
-      message: "Branch",
-      default: repo.defaultBranch,
-    });
-    name = await inputPrompt({
-      message: "Checkout name (blank for default)",
-    });
-  } catch (err) {
-    if (isBackSignal(err)) return false;
-    throw err;
-  }
+  clear();
+  title(`Checkout ${repoDisplayName(repo, true)}`);
+  console.log(color.dim("Creating checkout..."));
 
-  await runCommand(`Checkout ${repo.fullName}`, async () => {
+  try {
     const paths = getPaths();
     const config = await loadConfig(paths);
     const store = openStore(paths);
-    const result = await createCheckout({
+    await createCheckout({
       store,
       paths,
       config,
       repoArg: repo.fullName,
-      branch: branch.trim() || undefined,
-      name: name.trim() || undefined,
     });
-    console.log(`Checked out ${result.record.repo} as ${result.name}`);
-    console.log(`Path   ${result.record.path}`);
-    console.log(`Branch ${result.record.currentBranch ?? result.record.branch}`);
-    console.log(`Origin ${result.record.remoteUrl ?? "local mirror"}`);
-    console.log(`Status ${checkoutStatus(result.record)}`);
-  });
+  } catch (err) {
+    clear();
+    title(`Checkout ${repoDisplayName(repo, true)}`);
+    const message = err instanceof Error ? err.message : String(err);
+    console.log(`Error: ${message}`);
+    console.log("");
+    await pause();
+  }
+
   return true;
 }
 
-async function checkoutDetailFlow(): Promise<void> {
-  while (true) {
-    const ctx = await loadTuiContext();
-    const entries = Object.entries(ctx.state.checkouts).sort((a, b) => a[0].localeCompare(b[0]));
-    if (entries.length === 0) return;
+async function handleCheckoutSelection(name: string): Promise<void> {
+  const checkout = await refreshCheckout(name);
+  if (!checkout) return;
 
-    let name: string;
+  const unsafe = unsafeReason(checkout);
+  if (!unsafe) {
+    let confirmed: boolean;
     try {
-      name = await selectPrompt<string>({
-        message: "Select checkout",
-        pageSize: 12,
-        choices: entries.map(([checkoutName, checkout]) => ({
-          value: checkoutName,
-          name: `${checkoutName.padEnd(18)} ${checkout.repo.padEnd(32)} ${checkoutStatus(checkout)}`,
-          description: checkout.path,
-        })),
+      confirmed = await confirmCleanCheckout(name, checkout);
+    } catch (err) {
+      if (isBackSignal(err)) return;
+      throw err;
+    }
+    if (!confirmed) return;
+    await cleanCheckout(name);
+    return;
+  }
+
+  await checkoutWorkMenu(name);
+}
+
+async function confirmCleanCheckout(name: string, checkout: CheckoutRecord): Promise<boolean> {
+  clear();
+  title(`Remove ${name}`);
+  console.log(`Repo   ${checkout.repo}`);
+  console.log(`Path   ${checkout.path}`);
+  console.log(`Status ${checkoutStatus(checkout)}`);
+  console.log("");
+  return confirmPrompt({ message: "Remove checkout?", default: true });
+}
+
+async function refreshCheckout(name: string): Promise<CheckoutRecord | null> {
+  const paths = getPaths();
+  const store = openStore(paths);
+  const state = await store.read();
+  const resolvedName = resolveCheckoutName(state, name);
+  const scanned = await scanCheckouts(store, [resolvedName]);
+  return scanned[resolvedName] ?? null;
+}
+
+async function cleanCheckout(name: string): Promise<void> {
+  const store = openStore(getPaths());
+  const result = await cleanupCheckouts(store, { name });
+  if (result.refused.length) {
+    clear();
+    title(`Clean ${name}`);
+    printCleanupResult(result);
+    console.log("");
+    await pause();
+  }
+}
+
+async function checkoutWorkMenu(name: string): Promise<void> {
+  while (true) {
+    const checkout = await refreshCheckout(name);
+    if (!checkout) return;
+
+    clear();
+    title(name);
+    console.log(`${checkoutStatus(checkout)}  ${checkout.repo}  ${checkout.currentBranch ?? checkout.branch}`);
+    if (checkout.scanError) console.log(color.warn(`Warning  ${checkout.scanError}`));
+    console.log(color.dim(checkout.path));
+    console.log("");
+
+    const canDiff = checkout.dirty === true;
+    const canCommit = checkout.dirty === true;
+    const canPush = (checkout.ahead ?? 0) > 0;
+
+    if (!canDiff && !canCommit && !canPush) {
+      console.log(color.dim("No local diff or unpushed commits available."));
+      await pause();
+      return;
+    }
+
+    let action: CheckoutWorkAction;
+    try {
+      action = await selectPrompt<CheckoutWorkAction>({
+        message: "Menu",
+        choices: [
+          { value: "diff", name: "Diff", disabled: canDiff ? false : "(no changes)" },
+          { value: "commit", name: "Commit", disabled: canCommit ? false : "(no changes)" },
+          { value: "push", name: "Push", disabled: canPush ? false : "(nothing to push)" },
+        ],
       });
     } catch (err) {
       if (isBackSignal(err)) return;
       throw err;
     }
 
-    const next = await singleCheckoutActions(name);
-    if (next === "done") return;
+    if (action === "diff") await showCheckoutDiff(name, checkout);
+    else if (action === "commit") await commitCheckoutChanges(name, checkout);
+    else if (action === "push") await pushCheckoutChanges(name, checkout);
   }
 }
 
-async function singleCheckoutActions(name: string): Promise<"select" | "done"> {
-  while (true) {
-    const ctx = await loadTuiContext();
-    const resolvedName = resolveCheckoutName(ctx.state, name);
-    const checkout = ctx.state.checkouts[resolvedName];
-    if (!checkout) return "done";
+async function showCheckoutDiff(name: string, checkout: CheckoutRecord): Promise<void> {
+  await runCommand(`Diff ${name}`, async () => {
+    await printGitSection(checkout.path, "Status", ["status", "--short"]);
+    await printGitSection(checkout.path, "Unstaged", ["--no-pager", "diff"]);
+    await printGitSection(checkout.path, "Staged", ["--no-pager", "diff", "--cached"]);
+  });
+}
 
-    clear();
-    title(resolvedName);
-    console.log(`Repo       ${checkout.repo}`);
-    console.log(`Path       ${checkout.path}`);
-    console.log(`Branch     ${checkout.currentBranch ?? checkout.branch}`);
-    console.log(`Origin     ${checkout.remoteUrl ?? "local mirror"}`);
-    console.log(`Status     ${checkoutStatus(checkout)}`);
-    console.log(`Last scan  ${timeAgo(checkout.lastScan)}`);
-    if (checkout.scanError) console.log(`Warning    ${checkout.scanError}`);
-    const unsafe = unsafeReason(checkout);
-    if (unsafe) console.log(`Cleanup    blocked: ${unsafe}`);
-    else console.log("Cleanup    safe");
-    console.log("");
-
-    let action: CheckoutDetailAction;
-    try {
-      action = await selectPrompt<CheckoutDetailAction>({
-        message: "Checkout action",
-        choices: [
-          { value: "scan", name: "Scan" },
-          {
-            value: "cleanup",
-            name: "Cleanup if safe",
-            disabled: unsafe ? unsafe : false,
-          },
-          { value: "forceCleanup", name: "Force cleanup" },
-          { value: "path", name: "Show path" },
-        ],
-      });
-    } catch (err) {
-      if (isBackSignal(err)) return "select";
-      throw err;
-    }
-
-    if (action === "path") {
-      console.log("");
-      console.log(checkout.path);
-      await pause();
-    } else if (action === "scan") {
-      await runCommand(`Scan ${resolvedName}`, async () => {
-        const store = openStore(getPaths());
-        const scanned = await scanCheckouts(store, [resolvedName]);
-        console.log(`${resolvedName}: ${checkoutStatus(scanned[resolvedName])}`);
-      });
-    } else if (action === "cleanup") {
-      await runCommand(`Cleanup ${resolvedName}`, async () => {
-        const store = openStore(getPaths());
-        printCleanupResult(await cleanupCheckouts(store, { name: resolvedName }));
-      });
-      return "done";
-    } else if (action === "forceCleanup") {
-      let ok: boolean;
-      try {
-        ok = await confirmPrompt({
-          message: `Force delete ${resolvedName}? Dirty or unpushed work may be lost.`,
-          default: false,
-        });
-      } catch (err) {
-        if (isBackSignal(err)) continue;
-        throw err;
-      }
-      if (ok) {
-        await runCommand(`Force cleanup ${resolvedName}`, async () => {
-          const store = openStore(getPaths());
-          printCleanupResult(await cleanupCheckouts(store, { name: resolvedName, force: true }));
-        });
-        return "done";
-      }
-    }
+async function commitCheckoutChanges(name: string, checkout: CheckoutRecord): Promise<void> {
+  let message: string;
+  try {
+    message = await inputPrompt({ message: "Commit message" });
+  } catch (err) {
+    if (isBackSignal(err)) return;
+    throw err;
   }
+
+  const trimmed = message.trim();
+  if (!trimmed) return;
+
+  await runCommand(`Commit ${name}`, async () => {
+    await git(checkout.path, ["add", "-A"]);
+    const result = await git(checkout.path, ["commit", "-m", trimmed], 60_000);
+    printProcessOutput(result);
+    const refreshed = await refreshCheckout(name);
+    if (refreshed) console.log(`Status ${checkoutStatus(refreshed)}`);
+  });
+}
+
+async function pushCheckoutChanges(name: string, checkout: CheckoutRecord): Promise<void> {
+  await runCommand(`Push ${name}`, async () => {
+    const args = checkout.upstream ? ["push"] : ["push", "-u", "origin", "HEAD"];
+    const result = await git(checkout.path, args, 120_000);
+    printProcessOutput(result);
+    const refreshed = await refreshCheckout(name);
+    if (refreshed) console.log(`Status ${checkoutStatus(refreshed)}`);
+  });
+}
+
+async function printGitSection(repoPath: string, label: string, args: string[]): Promise<void> {
+  const result = await git(repoPath, args);
+  console.log(label);
+  console.log("-".repeat(Math.max(12, label.length)));
+  printProcessOutput(result, "(none)");
+  console.log("");
+}
+
+async function git(repoPath: string, args: string[], timeout = 30_000): Promise<{ stdout: string; stderr: string }> {
+  return execa("git", ["-C", repoPath, ...args], {
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    timeout,
+  });
+}
+
+function printProcessOutput(result: { stdout: string; stderr: string }, empty = ""): void {
+  const output = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
+  console.log(output || empty);
 }
 
 function printCleanupResult(result: {
@@ -647,15 +694,24 @@ function title(text: string): void {
   console.log("-".repeat(Math.max(12, Math.min(80, text.length))));
 }
 
-async function selectPrompt<Value>(config: Parameters<typeof select<Value>>[0]): Promise<Value> {
+interface PromptBehavior {
+  refreshMs?: number;
+}
+
+async function selectPrompt<Value>(
+  config: Parameters<typeof select<Value>>[0],
+  behavior: PromptBehavior = {},
+): Promise<Value> {
   return withEscapeBack((signal) =>
     select<Value>(
       {
         ...config,
         instructions: config.instructions ?? BACK_INSTRUCTIONS,
+        theme: { ...MENU_PROMPT_THEME, ...config.theme },
       },
       { signal },
     ),
+    behavior,
   );
 }
 
@@ -665,6 +721,7 @@ async function searchPrompt<Value>(config: Parameters<typeof search<Value>>[0]):
       {
         ...config,
         instructions: config.instructions ?? BACK_INSTRUCTIONS,
+        theme: { ...MENU_PROMPT_THEME, ...config.theme },
       },
       { signal },
     ),
@@ -676,16 +733,32 @@ async function inputPrompt(config: Parameters<typeof input>[0]): Promise<string>
 }
 
 async function confirmPrompt(config: Parameters<typeof confirm>[0]): Promise<boolean> {
-  return withEscapeBack((signal) => confirm(config, { signal }));
+  return withEscapeBack((signal) =>
+    confirm(
+      {
+        ...config,
+        theme: { prefix: "", ...config.theme },
+      },
+      { signal },
+    ),
+  );
 }
 
-async function withEscapeBack<Value>(fn: (signal: AbortSignal) => Promise<Value>): Promise<Value> {
+async function withEscapeBack<Value>(
+  fn: (signal: AbortSignal) => Promise<Value>,
+  behavior: PromptBehavior = {},
+): Promise<Value> {
   const controller = new AbortController();
   const onKeypress = (_char: string, key: KeypressEvent) => {
     if (!controller.signal.aborted && (key.name === "escape" || key.sequence === "\u001b")) {
       controller.abort(ESCAPE_ABORT_REASON);
     }
   };
+  const refreshTimer = behavior.refreshMs
+    ? setTimeout(() => {
+        if (!controller.signal.aborted) controller.abort(DASHBOARD_REFRESH_ABORT_REASON);
+      }, behavior.refreshMs)
+    : null;
 
   readline.emitKeypressEvents(process.stdin);
   process.stdin.on("keypress", onKeypress);
@@ -693,8 +766,10 @@ async function withEscapeBack<Value>(fn: (signal: AbortSignal) => Promise<Value>
     return await fn(controller.signal);
   } catch (err) {
     if (isEscapeAbort(err)) throw new BackSignal();
+    if (isDashboardRefreshAbort(err)) throw new DashboardRefreshSignal();
     throw err;
   } finally {
+    if (refreshTimer) clearTimeout(refreshTimer);
     process.stdin.removeListener("keypress", onKeypress);
   }
 }
@@ -708,14 +783,68 @@ function isBackSignal(err: unknown): boolean {
   return err instanceof BackSignal;
 }
 
+function isDashboardRefreshSignal(err: unknown): boolean {
+  return err instanceof DashboardRefreshSignal;
+}
+
 function isEscapeAbort(err: unknown): boolean {
+  return isPromptAbort(err, ESCAPE_ABORT_REASON);
+}
+
+function isDashboardRefreshAbort(err: unknown): boolean {
+  return isPromptAbort(err, DASHBOARD_REFRESH_ABORT_REASON);
+}
+
+function isPromptAbort(err: unknown, reason: string): boolean {
   return (
     err instanceof Error &&
     err.name === "AbortPromptError" &&
-    (err as Error & { cause?: unknown }).cause === ESCAPE_ABORT_REASON
+    (err as Error & { cause?: unknown }).cause === reason
   );
 }
 
 function isPromptExit(err: unknown): boolean {
   return err instanceof Error && err.name === "ExitPromptError";
+}
+
+const color = {
+  bold: ansi(1),
+  dim: ansi(2),
+  danger: ansi(31),
+  warn: ansi(33),
+  info: ansi(36),
+};
+
+function ansi(code: number): (value: string) => string {
+  return (value) => (process.stdout.isTTY ? `\x1b[${code}m${value}\x1b[0m` : value);
+}
+
+function rule(): string {
+  return color.dim("─".repeat(screenWidth()));
+}
+
+function screenWidth(): number {
+  return Math.max(56, Math.min(100, process.stdout.columns ?? 88));
+}
+
+function clock(date: Date): string {
+  return `${date.toISOString().slice(0, 19).replace("T", " ")} UTC`;
+}
+
+function dashboardRow(
+  label: string,
+  value: string,
+): void {
+  console.log(`${color.dim(label.padEnd(12))}${value}`);
+}
+
+function section(text: string): void {
+  console.log(color.bold(text));
+}
+
+function attentionLine(line: string): string {
+  if (line.startsWith("danger")) return color.danger(line);
+  if (line.startsWith("warn")) return color.warn(line);
+  if (line.startsWith("info")) return color.info(line);
+  return line;
 }

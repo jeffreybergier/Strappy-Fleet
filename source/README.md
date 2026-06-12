@@ -21,19 +21,20 @@ first-pass TUI, and direct GitHub-origin checkout management.
     stars/forks/watchers, created/updated/pushed timestamps, visibility,
     archived/fork/template flags, permissions — plus the **verbatim GitHub API
     object** as a hedge.
-  - *Tier 2* (`strappy enrich`, ~8 API calls per repo): language byte
-    breakdown, latest release, latest commit, branches, tags, contributors,
-    true open-PR count, and the README itself. Refreshed only when older than
-    `enrichmentMaxAgeDays` (config, default 7).
+  - *Tier 2* (`strappy sync` for stale repos, or `strappy enrich` manually,
+    ~8 API calls per repo): language byte breakdown, latest release, latest
+    commit, branches, tags, contributors, true open-PR count, and the README
+    itself. Refreshed only when older than `enrichmentMaxAgeDays` (config,
+    default 7).
 - Records everything in `strappy.db` (SQLite via better-sqlite3, queryable with
   plain SQL), guarded by a lock so a manual sync and the (future) daemon can't
   collide. A pre-existing `state.json` is imported automatically on first run.
 - The GitHub token is resolved from env / `secrets/github-token` / `gh` and is
   **never written into a mirror's git config**.
 
-Also present now: a first-pass interactive TUI shell for the dashboard,
-checkout-oriented repo search/actions, real checkout workflows, audit placeholder, and
-settings, plus a repo-local Codex skill at `skills/strappy-fleet` for AI-assisted
+Also present now: a first-pass interactive TUI shell with a live auth/health
+dashboard, checkout-oriented repo search/actions, and integrated checkout
+workflows, plus a repo-local Codex skill at `skills/strappy-fleet` for AI-assisted
 SQLite/CLI workflows. The daemon, audits, repo profiles, and deeper AI
 integration are still future work. Relay push is intentionally not part of the current checkout flow:
 checkouts use GitHub as `origin`, so normal `git push` works with your existing
@@ -63,9 +64,9 @@ Run with `npm run strappy -- <args>` (dev), or `npm run build && strappy <args>`
 ```bash
 npm run strappy --                     # interactive TUI when run in a TTY
 npm run strappy -- auth --check        # which token would be used?
-npm run strappy -- sync                # mirror everything (+ Tier-1 metadata)
+npm run strappy -- sync                # mirror everything (+ stale enrichment)
 npm run strappy -- sync owner/repo     # mirror just one
-npm run strappy -- enrich              # fetch Tier-2 metadata where stale
+npm run strappy -- enrich              # fetch Tier-2 metadata without mirroring
 npm run strappy -- enrich owner/repo --force   # refetch one repo now
 npm run strappy -- info owner/repo     # everything strappy knows about a repo
 npm run strappy -- info repo --json    # agent-friendly JSON (--full adds raw + README)
