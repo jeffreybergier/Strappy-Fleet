@@ -1,13 +1,13 @@
 # strappy-backup
 
 Keep durable bare **mirrors** of all your GitHub repositories in one place, and
-(later) hand out **ephemeral working copies** on demand. See [`plan.md`](./plan.md)
-for the full design.
+hand out **ephemeral working copies** under `/repo/checkouts` on demand. See
+[`plan.md`](./plan.md) for the full design.
 
-This repository currently implements **Milestone 1 — the mirror engine**: the
-backup is real once you've run a sync.
+This repository currently implements the mirror engine, metadata enrichment, a
+first-pass TUI, and direct GitHub-origin checkout management.
 
-## What M1 does
+## What it does
 
 - Enumerates your owned GitHub repos (plus any extra `owners` in config).
 - Mirrors each one with `git clone --mirror` into `$STRAPPY_HOME/mirrors/<owner>/<repo>.git`,
@@ -32,9 +32,11 @@ backup is real once you've run a sync.
   **never written into a mirror's git config**.
 
 Also present now: a first-pass interactive TUI shell for the dashboard, repo
-search/actions, checkout placeholder, audit placeholder, ask placeholder, and
-settings. The daemon (`M2`), real ephemeral checkouts + relay push (`M3`), full
-TUI-backed checkout workflows, audits, and pi integration are still future work.
+search/actions, real checkout workflows, audit placeholder, ask placeholder, and
+settings. The daemon, audits, repo profiles, and pi integration are still future
+work. Relay push is intentionally not part of the current checkout flow:
+checkouts use GitHub as `origin`, so normal `git push` works with your existing
+Git credentials.
 
 ## Setup
 
@@ -69,6 +71,11 @@ npm run strappy -- info repo --json    # agent-friendly JSON (--full adds raw + 
 npm run strappy -- list                # list mirrors
 npm run strappy -- list --stale        # only stale mirrors
 npm run strappy -- list --orphaned     # repos gone from GitHub
+npm run strappy -- checkout repo       # clone from mirror into /repo/checkouts/repo
+npm run strappy -- checkouts           # scan dirty/unpushed status
+npm run strappy -- checkouts --dirty   # only dirty checkouts
+npm run strappy -- cleanup repo        # delete if clean and fully pushed
+npm run strappy -- cleanup repo --force
 npm run strappy -- status              # backup health
 npm run strappy -- status --oneline    # one line for a shell prompt
 ```
@@ -86,19 +93,24 @@ and forwards any args you pass after the service name:
     volumes:
       - ./source:/repo/source
       - ./backups:/repo/backups
+      - ./checkouts:/repo/checkouts
     working_dir: /repo/source
     entrypoint: /bin/bash -lc 'npm install --no-fund --no-audit && exec npm run --silent strappy -- "$@"' bash
-    command: status
+    stdin_open: true
+    tty: true
 ```
 
 ```bash
+docker compose run --rm strappy              # interactive TUI
 docker compose run --rm strappy sync
 docker compose run --rm strappy list --stale
+docker compose run --rm strappy checkout repo
+docker compose run --rm strappy checkouts
 docker compose run --rm strappy status
 docker compose run --rm strappy auth          # interactive token prompt
 ```
 
-The args you type after `strappy` replace `command`, and the `entrypoint`
-forwards them to the CLI via `"$@"` (the trailing `bash` is `$0`). `--rm`
-removes the one-off container on exit; `./backups` is mounted, so mirrors
-persist on the host between runs.
+The `entrypoint` forwards anything after `strappy` to the CLI via `"$@"` (the
+trailing `bash` is `$0`). `--rm` removes the one-off container on exit;
+`./backups` and `./checkouts` are mounted, so mirrors and disposable working
+copies persist on the host between runs.

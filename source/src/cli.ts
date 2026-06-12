@@ -2,9 +2,13 @@
 import "dotenv/config";
 import { Command } from "commander";
 import { authCheck, authCommand } from "./commands/auth.js";
+import { checkoutCommand } from "./commands/checkout.js";
+import { checkoutsCommand } from "./commands/checkouts.js";
+import { cleanupCommand } from "./commands/cleanup.js";
 import { enrichCommand } from "./commands/enrich.js";
 import { infoCommand } from "./commands/info.js";
 import { listCommand } from "./commands/list.js";
+import { scanCheckoutsCommand } from "./commands/scan-checkouts.js";
 import { statusCommand } from "./commands/status.js";
 import { syncCommand } from "./commands/sync.js";
 import { runTui } from "./tui.js";
@@ -69,6 +73,46 @@ program
   .option("--oneline", "single machine-readable line for prompts/scripts")
   .action(async (opts: { oneline?: boolean }) => {
     await statusCommand(opts);
+  });
+
+program
+  .command("checkout")
+  .description("Create a disposable checkout under /repo/checkouts")
+  .argument("<repo>", '"owner/name" or "name"')
+  .option("--branch <branch>", "branch to checkout (default: repo default branch)")
+  .option("--name <name>", "checkout registry name and default directory name")
+  .option("--path <path>", "custom checkout path")
+  .action(async (repo: string, opts: { branch?: string; name?: string; path?: string }) => {
+    await checkoutCommand(repo, opts);
+  });
+
+program
+  .command("checkouts")
+  .description("List registered checkouts with dirty/unpushed status")
+  .option("--dirty", "only dirty checkouts")
+  .option("--unpushed", "only checkouts with commits not on a remote")
+  .option("--json", "machine-readable output")
+  .action(async (opts: { dirty?: boolean; unpushed?: boolean; json?: boolean }) => {
+    await checkoutsCommand(opts);
+  });
+
+program
+  .command("scan-checkouts")
+  .description("Refresh dirty/unpushed status for registered checkouts")
+  .argument("[names...]", "checkout names to scan (default: all)")
+  .option("--all", "scan all checkouts")
+  .action(async (names: string[], opts: { all?: boolean }) => {
+    await scanCheckoutsCommand(names, opts);
+  });
+
+program
+  .command("cleanup")
+  .description("Delete safe disposable checkouts")
+  .argument("[name]", "checkout name to remove")
+  .option("--all", "cleanup all safe checkouts")
+  .option("--force", "delete even with dirty or unpushed work")
+  .action(async (name: string | undefined, opts: { all?: boolean; force?: boolean }) => {
+    await cleanupCommand(name, opts);
   });
 
 program.action(async () => {

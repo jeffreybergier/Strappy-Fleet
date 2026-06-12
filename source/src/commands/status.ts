@@ -36,7 +36,7 @@ export async function statusCommand(opts: StatusOptions): Promise<void> {
   console.log(`Mirrors        ${repos.length}  (${humanSize(totalKb)})`);
   console.log(`Failures       ${failures}`);
   console.log(`Orphaned       ${orphaned}`);
-  console.log(`Checkouts      ${Object.keys(state.checkouts).length}  (Milestone 3)`);
+  console.log(`Checkouts      ${Object.keys(state.checkouts).length}`);
   console.log(`Concurrency    ${config.concurrency}   Schedule ${config.schedule}`);
 
   if (failures > 0) {

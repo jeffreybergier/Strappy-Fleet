@@ -5,8 +5,7 @@ they were one dynamic monorepo. It has five jobs:
 
 1. Keep durable bare mirrors of every repo.
 2. Create disposable working copies under `/repo/checkouts/`.
-3. Show which checkouts contain local work, unpushed commits, or pending relay
-   pushes.
+3. Show which checkouts contain local work or commits not pushed to GitHub.
 4. Audit GitHub repo configuration across the fleet.
 5. Let an AI agent, via Pi, answer questions about the repos using local
    mirrors and normalized metadata.
@@ -82,7 +81,7 @@ The current `repos` and `enrichment` tables are the base. Add or extend:
 | Table | Purpose |
 | --- | --- |
 | `checkouts` | Registered working copies, path, branch, mode, last scan, dirty/ahead flags. |
-| `checkout_branches` | Per-branch status: local head, upstream head, ahead/behind, pending relay. |
+| `checkout_branches` | Per-branch status: local head, upstream head, ahead/behind, unpushed commits. |
 | `audit_findings` | Repo findings with category, severity, evidence, remediation, timestamps. |
 | `repo_profiles` | Deterministic technology classification and project type. |
 | `agent_notes` | Optional Pi summaries/digests generated from Strappy tools. |
@@ -129,10 +128,9 @@ This should be the next major product step because it turns Strappy from
 ### Commands
 
 ```
-strappy checkout <repo> [--branch B] [--name NAME] [--path PATH] [--direct]
+strappy checkout <repo> [--branch B] [--name NAME] [--path PATH]
 strappy checkouts [--dirty|--unpushed|--json]
 strappy scan-checkouts [name|--all]
-strappy push <name-or-repo> [branch]
 strappy cleanup [name|--all|--older-than AGE] [--force]
 strappy open <name-or-repo>             # print path, or optionally launch $EDITOR
 ```
@@ -148,12 +146,14 @@ Default checkout path:
 1. Resolve repo by `owner/name`, bare `name`, or fuzzy search in the TUI.
 2. Ensure the mirror exists and is fresh enough, fetching if online.
 3. Clone from the local mirror into the checkout root.
-4. Set `origin` to the local mirror by default.
+4. Set `origin` to GitHub so normal `git push` uses the user's existing Git
+   credentials.
 5. Register the checkout in SQLite.
 6. Run the first checkout scan immediately.
 
-`--direct` remains an escape hatch that sets `origin` to GitHub and relies on
-ambient credentials. The default should stay local-mirror origin.
+Relay push is deliberately deferred. It may come back later as an optional
+advanced mode, but the current product should keep checkouts understandable:
+clone fast from the local mirror, then push directly to GitHub.
 
 ### Status Model
 
@@ -162,37 +162,15 @@ A checkout is safe to delete only when all of these are false:
 - dirty working tree: `git status --porcelain=v1` has output
 - local commits not pushed to the mirror: `git log --branches --not --remotes`
   has output
-- mirror refs created by this checkout have not been relayed to GitHub
+- local commits are not reachable from any remote-tracking ref
 
 Track three separate concepts in the UI:
 
 | Status | Meaning |
 | --- | --- |
 | `dirty` | Files changed, staged, unstaged, or untracked in the checkout. |
-| `ahead of mirror` | Local branch commits exist only in the checkout. |
-| `pending GitHub push` | Commits reached the mirror but are not confirmed on GitHub. |
-
-That distinction matters because a user may run `git push origin my-branch`,
-which pushes to the local mirror, but still needs `strappy push` to relay that
-branch to GitHub.
-
-### Relay Push
-
-Default flow:
-
-```
-git push origin my-branch                 # checkout -> local mirror
-strappy push widget my-branch             # local mirror -> GitHub
-```
-
-Implementation:
-
-- Add a clean `github` remote in the mirror, or push to an authenticated URL
-  without writing the token to config.
-- Push only the named ref, never `--mirror`.
-- Record relay attempts and outcomes.
-- After relay, fetch/sync the mirror and mark the ref confirmed only when the
-  commit is visible from GitHub.
+| `unpushed` | Local branch commits are not reachable from remote-tracking refs. |
+| `behind` | Current branch is behind its upstream. |
 
 ### Cleanup
 
@@ -304,7 +282,7 @@ Pi should get tools like:
 | --- | --- |
 | `list_repos` | SQLite repo inventory, filters, profiles. |
 | `repo_profile` | Deterministic profile + enrichment + recent activity. |
-| `checkout_status` | Dirty/unpushed/pending relay state. |
+| `checkout_status` | Dirty/unpushed/behind state. |
 | `audit_findings` | Current findings and dismissed/resolved state. |
 | `git_log` | `git log` against the local mirror. |
 | `list_files` | `git ls-tree` at a ref. |
@@ -352,7 +330,7 @@ the fleet dashboard.
   Recent Checkouts
   name        repo                 branch   age    status
   widget      me/widget            main     3d     dirty, ahead of mirror
-  api         org/api              feat/x   8h     pending GitHub push
+  api         org/api              feat/x   8h     clean
 
   Recent Sync
   126 ok   2 failed   1 orphaned   next daemon run in 3h
@@ -366,7 +344,7 @@ Use tabs or a left rail:
 | --- | --- | --- |
 | Dashboard | Fleet health summary. | Sync now, scan checkouts, run audit. |
 | Repos | Search/browse all mirrors and metadata. | Checkout, sync one, enrich, profile, info. |
-| Checkouts | Manage `/repo/checkouts`. | Open path, scan, relay push, cleanup safe, force cleanup. |
+| Checkouts | Manage `/repo/checkouts`. | Open path, scan, cleanup safe, force cleanup. |
 | Audits | Findings by repo/category/severity. | Refresh, dismiss, copy remediation, open GitHub URL. |
 | Ask | Pi-powered repo Q&A. | Ask, save answer, jump to referenced repo. |
 | Settings | Auth, owners, schedules, checkout root, scopes. | Check token, edit config, test GitHub scopes. |
@@ -397,17 +375,15 @@ Actions for selected repo:
 Columns:
 
 ```
-name       branch      dirty   ahead mirror   pending GitHub   age   path
-widget     main        yes     2 commits      no               3d    /repo/checkouts/widget
-api        feat/x      no      0              yes              8h    /repo/checkouts/api
+name       branch      dirty   unpushed   behind   age   path
+widget     main        yes     2 commits  0        3d    /repo/checkouts/widget
+api        feat/x      no      0          1        8h    /repo/checkouts/api
 ```
 
 Actions:
 
 - rescan
 - open shell/path
-- push to mirror instructions if ahead of mirror
-- relay push to GitHub if pending
 - cleanup if safe
 - force cleanup with explicit confirmation
 
@@ -474,10 +450,9 @@ strappy profile [repo...] [--force]
 strappy list [--stale|--orphaned|--type T]
 strappy info <repo> [--json|--full]
 
-strappy checkout <repo> [--branch B] [--name N] [--path P] [--direct]
+strappy checkout <repo> [--branch B] [--name N] [--path P]
 strappy checkouts [--dirty|--unpushed|--json]
 strappy scan-checkouts [name|--all]
-strappy push <name-or-repo> [branch]
 strappy cleanup [name|--all|--older-than AGE] [--force]
 
 strappy audit [repo...] [--category C] [--force]
@@ -511,18 +486,16 @@ strappy status [--oneline]
 
 1. **M1 - Mirror engine (done):** auth, inventory, sync, enrichment, info,
    list, status, SQLite store.
-2. **M2 - Checkout manager:** checkout into `/repo/checkouts`, scan dirty/ahead
+2. **M2 - Checkout manager (done):** checkout into `/repo/checkouts`, scan dirty/unpushed
    state, list checkouts, cleanup safe checkouts.
-3. **M3 - Relay push:** local mirror origin flow, explicit `strappy push`,
-   pending GitHub push tracking.
-4. **M4 - TUI v1:** dashboard, repo search, checkout actions, sync/enrich
+3. **M3 - TUI checkout workflows (done):** dashboard, repo search, checkout actions, sync/enrich
    actions using `@inquirer/prompts`.
-5. **M5 - Audit engine:** branch protection, collaborators, Actions, security,
+4. **M4 - Audit engine:** branch protection, collaborators, Actions, security,
    hygiene findings stored in SQLite.
-6. **M6 - Repo profiles:** deterministic project type/technology classifier.
-7. **M7 - Pi Ask:** read-only tools over inventory, profiles, mirrors,
+5. **M5 - Repo profiles:** deterministic project type/technology classifier.
+6. **M6 - Pi Ask:** read-only tools over inventory, profiles, mirrors,
    checkouts, and audit findings.
-8. **M8 - Daemon:** scheduled sync, audit refresh, checkout scans, optional AI
+7. **M7 - Daemon:** scheduled sync, audit refresh, checkout scans, optional AI
    digest.
 
 This ordering prioritizes daily usefulness: backup already works, so the next
@@ -534,11 +507,8 @@ valuable thing is knowing what is checked out and whether it is safe to clean.
 
 - Should `/repo/checkouts` always be the default in this repo, or only when that
   path exists?
-- Should the default checkout remote be local mirror only, or should Strappy add
-  a read-only `github` remote for comparison while keeping credentials out of
-  checkout config?
-- For relay push, should users explicitly run `strappy push`, or should the
-  daemon auto-relay branches matching `refs/strappy/outbox/*`?
+- Should Strappy add an optional local-mirror remote for comparison, while
+  keeping `origin` pointed at GitHub?
 - How aggressive should cleanup be: only manual, or "delete all safe checkouts
   older than N days" from the TUI?
 - Are you comfortable granting the audit token administration/read and

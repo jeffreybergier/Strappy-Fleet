@@ -21,12 +21,24 @@ export interface RepoRecord {
   enrichment: RepoEnrichment | null;
 }
 
-/** Ephemeral working copy registry — populated in Milestone 3, defined now for shape stability. */
+/** Ephemeral working copy registry and last-known safety scan. */
 export interface CheckoutRecord {
   repo: string;
   path: string;
   createdAt: string;
   branch: string;
+  /** `github` is the normal direct-push flow; `local` is retained for escape hatches/tests. */
+  mode: "github" | "local";
+  remoteUrl: string | null;
+  lastScan: string | null;
+  exists: boolean | null;
+  dirty: boolean | null;
+  ahead: number | null;
+  behind: number | null;
+  currentBranch: string | null;
+  headSha: string | null;
+  upstream: string | null;
+  scanError: string | null;
 }
 
 export interface StrappyState {
@@ -78,7 +90,28 @@ export function normalize(s: Partial<StrappyState>): StrappyState {
     // version — keeping a legacy file's version would persist "1" forever.
     version: STATE_VERSION,
     repos,
-    checkouts: s.checkouts ?? {},
+    checkouts: normalizeCheckouts(s.checkouts ?? {}),
     lastInventoryAt: s.lastInventoryAt ?? null,
   };
+}
+
+function normalizeCheckouts(checkouts: Record<string, CheckoutRecord>): Record<string, CheckoutRecord> {
+  const out: Record<string, CheckoutRecord> = {};
+  for (const [name, c] of Object.entries(checkouts)) {
+    out[name] = {
+      ...c,
+      mode: c.mode ?? "github",
+      remoteUrl: c.remoteUrl ?? null,
+      lastScan: c.lastScan ?? null,
+      exists: c.exists ?? null,
+      dirty: c.dirty ?? null,
+      ahead: c.ahead ?? null,
+      behind: c.behind ?? null,
+      currentBranch: c.currentBranch ?? null,
+      headSha: c.headSha ?? null,
+      upstream: c.upstream ?? null,
+      scanError: c.scanError ?? null,
+    };
+  }
+  return out;
 }

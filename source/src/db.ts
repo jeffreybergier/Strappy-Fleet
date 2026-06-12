@@ -85,7 +85,18 @@ CREATE TABLE IF NOT EXISTS checkouts (
   repo       TEXT NOT NULL,
   path       TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  branch     TEXT NOT NULL
+  branch     TEXT NOT NULL,
+  mode       TEXT NOT NULL DEFAULT 'github',
+  remote_url TEXT,
+  last_scan  TEXT,
+  exists_on_disk INTEGER,
+  dirty      INTEGER,
+  ahead      INTEGER,
+  behind     INTEGER,
+  current_branch TEXT,
+  head_sha   TEXT,
+  upstream   TEXT,
+  scan_error TEXT
 );
 `;
 
@@ -132,6 +143,7 @@ export class SqliteStore implements Store {
     db.pragma("journal_mode = WAL");
     db.pragma("synchronous = NORMAL");
     db.exec(SCHEMA);
+    migrate(db);
     this.db = db;
     await this.importLegacyJson(db);
     return db;
@@ -210,6 +222,17 @@ function readState(db: Database.Database): StrappyState {
       path: row.path,
       createdAt: row.created_at,
       branch: row.branch,
+      mode: row.mode === "local" ? "local" : "github",
+      remoteUrl: row.remote_url,
+      lastScan: row.last_scan,
+      exists: fromBool(row.exists_on_disk),
+      dirty: fromBool(row.dirty),
+      ahead: row.ahead,
+      behind: row.behind,
+      currentBranch: row.current_branch,
+      headSha: row.head_sha,
+      upstream: row.upstream,
+      scanError: row.scan_error,
     };
   }
 
@@ -257,9 +280,13 @@ function writeState(db: Database.Database, state: StrappyState): void {
         @github_id, @fetched_at, @languages, @latest_release, @has_releases,
         @latest_commit, @branches, @tags, @contributors, @open_pr_count, @readme
       )`);
-    const insertCheckout = db.prepare(
-      "INSERT INTO checkouts (name, repo, path, created_at, branch) VALUES (?, ?, ?, ?, ?)",
-    );
+    const insertCheckout = db.prepare(`
+      INSERT INTO checkouts (
+        name, repo, path, created_at, branch, mode, remote_url, last_scan,
+        exists_on_disk, dirty, ahead, behind, current_branch, head_sha,
+        upstream, scan_error
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
     const putMeta = db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)");
     const delMeta = db.prepare("DELETE FROM meta WHERE key = ?");
 
@@ -285,7 +312,24 @@ function writeState(db: Database.Database, state: StrappyState): void {
         }
       }
       for (const [name, c] of Object.entries(s.checkouts)) {
-        insertCheckout.run(name, c.repo, c.path, c.createdAt, c.branch);
+        insertCheckout.run(
+          name,
+          c.repo,
+          c.path,
+          c.createdAt,
+          c.branch,
+          c.mode,
+          c.remoteUrl,
+          c.lastScan,
+          toBool(c.exists),
+          toBool(c.dirty),
+          c.ahead,
+          c.behind,
+          c.currentBranch,
+          c.headSha,
+          c.upstream,
+          c.scanError,
+        );
       }
       putMeta.run("version", String(s.version));
       if (s.lastInventoryAt === null) delMeta.run("last_inventory_at");
@@ -435,6 +479,17 @@ interface CheckoutRow {
   path: string;
   created_at: string;
   branch: string;
+  mode: string | null;
+  remote_url: string | null;
+  last_scan: string | null;
+  exists_on_disk: number | null;
+  dirty: number | null;
+  ahead: number | null;
+  behind: number | null;
+  current_branch: string | null;
+  head_sha: string | null;
+  upstream: string | null;
+  scan_error: string | null;
 }
 
 function json(v: unknown): string | null {
@@ -459,4 +514,25 @@ async function ensureFile(p: string): Promise<void> {
   } catch {
     await fs.writeFile(p, "", "utf8");
   }
+}
+
+function migrate(db: Database.Database): void {
+  const cols = new Set(
+    (db.prepare("PRAGMA table_info(checkouts)").all() as { name: string }[]).map((c) => c.name),
+  );
+  const add = (name: string, ddl: string) => {
+    if (!cols.has(name)) db.exec(`ALTER TABLE checkouts ADD COLUMN ${ddl}`);
+  };
+
+  add("mode", "mode TEXT NOT NULL DEFAULT 'github'");
+  add("remote_url", "remote_url TEXT");
+  add("last_scan", "last_scan TEXT");
+  add("exists_on_disk", "exists_on_disk INTEGER");
+  add("dirty", "dirty INTEGER");
+  add("ahead", "ahead INTEGER");
+  add("behind", "behind INTEGER");
+  add("current_branch", "current_branch TEXT");
+  add("head_sha", "head_sha TEXT");
+  add("upstream", "upstream TEXT");
+  add("scan_error", "scan_error TEXT");
 }

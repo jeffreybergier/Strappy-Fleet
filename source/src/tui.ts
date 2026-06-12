@@ -1,7 +1,15 @@
 import fs from "node:fs/promises";
-import { input, search, select } from "@inquirer/prompts";
+import { confirm, input, search, select } from "@inquirer/prompts";
 import { resolveToken } from "./auth.js";
-import { resolveCheckoutRoot } from "./checkouts.js";
+import {
+  checkoutStatus,
+  cleanupCheckouts,
+  createCheckout,
+  resolveCheckoutName,
+  resolveCheckoutRoot,
+  scanCheckouts,
+  unsafeReason,
+} from "./checkouts.js";
 import { authCheck } from "./commands/auth.js";
 import { enrichCommand } from "./commands/enrich.js";
 import { infoCommand } from "./commands/info.js";
@@ -34,6 +42,8 @@ type RepoAction =
   | "main";
 
 type SettingsAction = "auth" | "status" | "back";
+type CheckoutsAction = "create" | "select" | "scan" | "cleanup" | "back";
+type CheckoutDetailAction = "scan" | "cleanup" | "forceCleanup" | "path" | "back";
 
 interface Choice<Value> {
   value: Value;
@@ -65,7 +75,7 @@ export async function runTui(): Promise<void> {
           { value: "repos", name: "Repos", description: "Search mirrors and run repo actions" },
           { value: "sync", name: "Sync now", description: "Refresh GitHub inventory and mirrors" },
           { value: "enrich", name: "Enrich stale repos", description: "Fetch languages, branches, releases, README" },
-          { value: "checkouts", name: "Checkouts", description: "Registered working copies and next checkout work" },
+          { value: "checkouts", name: "Checkouts", description: "Create, scan, and cleanup working copies" },
           { value: "audits", name: "Audits", description: "Planned GitHub posture findings" },
           { value: "ask", name: "Ask", description: "Planned Pi-powered repo questions" },
           { value: "settings", name: "Settings", description: "Paths, auth, and config" },
@@ -210,24 +220,66 @@ async function repoActions(repo: RepoRecord): Promise<"search" | "main"> {
 }
 
 async function checkoutsView(): Promise<void> {
-  const ctx = await loadTuiContext();
-  const checkouts = Object.entries(ctx.state.checkouts).sort((a, b) => a[0].localeCompare(b[0]));
+  while (true) {
+    const ctx = await loadTuiContext();
+    const checkouts = Object.entries(ctx.state.checkouts).sort((a, b) => a[0].localeCompare(b[0]));
 
-  clear();
-  title("Checkouts");
-  console.log(`Root  ${ctx.checkoutRoot}`);
-  console.log("");
+    clear();
+    title("Checkouts");
+    console.log(`Root  ${ctx.checkoutRoot}`);
+    console.log("");
 
-  if (checkouts.length === 0) {
-    console.log("No registered checkouts yet.");
-  } else {
-    console.log("name               repo                             branch           path");
-    for (const [name, checkout] of checkouts) printCheckout(name, checkout);
+    if (checkouts.length === 0) {
+      console.log("No registered checkouts yet.");
+    } else {
+      console.log("name               repo                             branch           status                 path");
+      for (const [name, checkout] of checkouts) printCheckout(name, checkout);
+    }
+
+    console.log("");
+    const action = await select<CheckoutsAction>({
+      message: "Checkout action",
+      choices: [
+        { value: "create", name: "Create checkout", description: "Clone from mirror into the checkout root" },
+        {
+          value: "select",
+          name: "Select checkout",
+          description: "Inspect, scan, or cleanup one checkout",
+          disabled: checkouts.length === 0 ? "No registered checkouts" : false,
+        },
+        {
+          value: "scan",
+          name: "Scan all",
+          description: "Refresh dirty/unpushed status",
+          disabled: checkouts.length === 0 ? "No registered checkouts" : false,
+        },
+        {
+          value: "cleanup",
+          name: "Cleanup all safe",
+          description: "Deletes only checkouts with no dirty or unpushed work",
+          disabled: checkouts.length === 0 ? "No registered checkouts" : false,
+        },
+        { value: "back", name: "Back to main menu" },
+      ],
+    });
+
+    if (action === "back") return;
+    if (action === "create") await createCheckoutFlow();
+    else if (action === "scan") await runCommand("Scan checkouts", async () => {
+      const store = openStore(getPaths());
+      const scanned = await scanCheckouts(store);
+      for (const [name, checkout] of Object.entries(scanned)) {
+        console.log(`${name}: ${checkoutStatus(checkout)}`);
+      }
+      if (Object.keys(scanned).length === 0) console.log("No registered checkouts.");
+    });
+    else if (action === "cleanup") await runCommand("Cleanup safe checkouts", async () => {
+      const store = openStore(getPaths());
+      const result = await cleanupCheckouts(store, { all: true });
+      printCleanupResult(result);
+    });
+    else if (action === "select") await checkoutDetailFlow();
   }
-
-  console.log("");
-  console.log("Planned next: checkout creation, dirty/ahead scans, relay-push status, and safe cleanup.");
-  await pause();
 }
 
 async function settingsView(): Promise<void> {
@@ -385,9 +437,156 @@ async function findRepo(fullName: string): Promise<RepoRecord | null> {
 }
 
 function printCheckout(name: string, checkout: CheckoutRecord): void {
+  const branch = checkout.currentBranch ?? checkout.branch;
+  const status = checkoutStatus(checkout);
   console.log(
-    `${name.padEnd(18)} ${checkout.repo.padEnd(32)} ${checkout.branch.padEnd(16)} ${checkout.path}`,
+    `${name.padEnd(18)} ${checkout.repo.padEnd(32)} ${branch.padEnd(16)} ` +
+      `${status.padEnd(22)} ${checkout.path}`,
   );
+}
+
+async function createCheckoutFlow(): Promise<void> {
+  const ctx = await loadTuiContext();
+  const records = Object.values(ctx.state.repos).sort((a, b) => a.fullName.localeCompare(b.fullName));
+  if (records.length === 0) {
+    await plannedView("Create Checkout", ["No repos in inventory. Run Sync now first."]);
+    return;
+  }
+
+  const repo = await search<RepoRecord>({
+    message: "Repo to checkout",
+    pageSize: 12,
+    source: (term) => repoChoices(records, term),
+  });
+  const branch = await input({
+    message: "Branch",
+    default: repo.defaultBranch,
+  });
+  const name = await input({
+    message: "Checkout name (blank for default)",
+  });
+
+  await runCommand(`Checkout ${repo.fullName}`, async () => {
+    const paths = getPaths();
+    const config = await loadConfig(paths);
+    const store = openStore(paths);
+    const result = await createCheckout({
+      store,
+      paths,
+      config,
+      repoArg: repo.fullName,
+      branch: branch.trim() || undefined,
+      name: name.trim() || undefined,
+    });
+    console.log(`Checked out ${result.record.repo} as ${result.name}`);
+    console.log(`Path   ${result.record.path}`);
+    console.log(`Branch ${result.record.currentBranch ?? result.record.branch}`);
+    console.log(`Origin ${result.record.remoteUrl ?? "local mirror"}`);
+    console.log(`Status ${checkoutStatus(result.record)}`);
+  });
+}
+
+async function checkoutDetailFlow(): Promise<void> {
+  while (true) {
+    const ctx = await loadTuiContext();
+    const entries = Object.entries(ctx.state.checkouts).sort((a, b) => a[0].localeCompare(b[0]));
+    if (entries.length === 0) return;
+
+    const name = await select<string>({
+      message: "Select checkout",
+      pageSize: 12,
+      choices: entries.map(([checkoutName, checkout]) => ({
+        value: checkoutName,
+        name: `${checkoutName.padEnd(18)} ${checkout.repo.padEnd(32)} ${checkoutStatus(checkout)}`,
+        description: checkout.path,
+      })),
+    });
+
+    const next = await singleCheckoutActions(name);
+    if (next === "back") return;
+  }
+}
+
+async function singleCheckoutActions(name: string): Promise<"again" | "back"> {
+  while (true) {
+    const ctx = await loadTuiContext();
+    const resolvedName = resolveCheckoutName(ctx.state, name);
+    const checkout = ctx.state.checkouts[resolvedName];
+    if (!checkout) return "back";
+
+    clear();
+    title(resolvedName);
+    console.log(`Repo       ${checkout.repo}`);
+    console.log(`Path       ${checkout.path}`);
+    console.log(`Branch     ${checkout.currentBranch ?? checkout.branch}`);
+    console.log(`Origin     ${checkout.remoteUrl ?? "local mirror"}`);
+    console.log(`Status     ${checkoutStatus(checkout)}`);
+    console.log(`Last scan  ${timeAgo(checkout.lastScan)}`);
+    if (checkout.scanError) console.log(`Warning    ${checkout.scanError}`);
+    const unsafe = unsafeReason(checkout);
+    if (unsafe) console.log(`Cleanup    blocked: ${unsafe}`);
+    else console.log("Cleanup    safe");
+    console.log("");
+
+    const action = await select<CheckoutDetailAction>({
+      message: "Checkout action",
+      choices: [
+        { value: "scan", name: "Scan" },
+        {
+          value: "cleanup",
+          name: "Cleanup if safe",
+          disabled: unsafe ? unsafe : false,
+        },
+        { value: "forceCleanup", name: "Force cleanup" },
+        { value: "path", name: "Show path" },
+        { value: "back", name: "Back to checkouts" },
+      ],
+    });
+
+    if (action === "back") return "back";
+    if (action === "path") {
+      console.log("");
+      console.log(checkout.path);
+      await pause();
+    } else if (action === "scan") {
+      await runCommand(`Scan ${resolvedName}`, async () => {
+        const store = openStore(getPaths());
+        const scanned = await scanCheckouts(store, [resolvedName]);
+        console.log(`${resolvedName}: ${checkoutStatus(scanned[resolvedName])}`);
+      });
+    } else if (action === "cleanup") {
+      await runCommand(`Cleanup ${resolvedName}`, async () => {
+        const store = openStore(getPaths());
+        printCleanupResult(await cleanupCheckouts(store, { name: resolvedName }));
+      });
+      return "back";
+    } else if (action === "forceCleanup") {
+      const ok = await confirm({
+        message: `Force delete ${resolvedName}? Dirty or unpushed work may be lost.`,
+        default: false,
+      });
+      if (ok) {
+        await runCommand(`Force cleanup ${resolvedName}`, async () => {
+          const store = openStore(getPaths());
+          printCleanupResult(await cleanupCheckouts(store, { name: resolvedName, force: true }));
+        });
+        return "back";
+      }
+    }
+  }
+}
+
+function printCleanupResult(result: {
+  removed: string[];
+  refused: { name: string; reason: string }[];
+  missing: string[];
+}): void {
+  for (const removed of result.removed) console.log(`Removed ${removed}`);
+  for (const missing of result.missing) console.log(`Unregistered missing checkout ${missing}`);
+  for (const refused of result.refused) console.log(`Refused ${refused.name}: ${refused.reason}`);
+  if (!result.removed.length && !result.missing.length && !result.refused.length) {
+    console.log("Nothing to clean.");
+  }
 }
 
 async function pause(message = "Press Enter to continue"): Promise<void> {
