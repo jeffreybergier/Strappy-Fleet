@@ -146,10 +146,12 @@ Default checkout path:
 1. Resolve repo by `owner/name`, bare `name`, or fuzzy search in the TUI.
 2. Ensure the mirror exists and is fresh enough, fetching if online.
 3. Clone from the local mirror into the checkout root.
-4. Set `origin` to GitHub so normal `git push` uses the user's existing Git
+4. Create a new work branch named `vibing/YYYY-MM-DD` from the repo default
+   branch unless the user passed `--branch`.
+5. Set `origin` to GitHub so normal `git push` uses the user's existing Git
    credentials.
-5. Register the checkout in SQLite.
-6. Run the first checkout scan immediately.
+6. Register the checkout in SQLite.
+7. Run the first checkout scan immediately.
 
 Relay push is deliberately deferred. It may come back later as an optional
 advanced mode, but the current product should keep checkouts understandable:

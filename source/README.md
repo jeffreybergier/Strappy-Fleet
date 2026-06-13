@@ -77,7 +77,7 @@ npm run strappy -- info repo --json    # agent-friendly JSON (--full adds raw/fi
 npm run strappy -- list                # list mirrors
 npm run strappy -- list --stale        # only stale mirrors
 npm run strappy -- list --orphaned     # repos gone from GitHub
-npm run strappy -- checkout repo       # clone from mirror into /repo/checkouts/repo
+npm run strappy -- checkout repo       # clone into /repo/checkouts/repo on vibing/YYYY-MM-DD
 npm run strappy -- checkouts           # scan dirty/unpushed status
 npm run strappy -- checkouts --dirty   # only dirty checkouts
 npm run strappy -- cleanup repo        # delete if clean and fully pushed

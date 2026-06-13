@@ -47,7 +47,7 @@ type AuditAction =
   | "main-unprotected"
   | "default-branch-not-main";
 
-type CheckoutWorkAction = "diff" | "commit" | "push";
+type CheckoutWorkAction = "diff" | "commit" | "push" | "reset";
 
 interface Choice<Value> {
   value: Value;
@@ -1098,6 +1098,7 @@ async function checkoutWorkMenu(name: string): Promise<void> {
     const canDiff = checkout.dirty === true;
     const canCommit = checkout.dirty === true;
     const canPush = (checkout.ahead ?? 0) > 0;
+    const canReset = checkout.dirty === true;
 
     if (!canDiff && !canCommit && !canPush) {
       console.log(color.dim("No local diff or unpushed commits available."));
@@ -1112,6 +1113,7 @@ async function checkoutWorkMenu(name: string): Promise<void> {
         choices: [
           { value: "diff", name: "Diff", disabled: canDiff ? false : "(no changes)" },
           { value: "commit", name: "Commit", disabled: canCommit ? false : "(no changes)" },
+          { value: "reset", name: "Reset", disabled: canReset ? false : "(no changes)" },
           { value: "push", name: "Push", disabled: canPush ? false : "(nothing to push)" },
         ],
       });
@@ -1122,6 +1124,9 @@ async function checkoutWorkMenu(name: string): Promise<void> {
 
     if (action === "diff") await showCheckoutDiff(name, checkout);
     else if (action === "commit") await commitCheckoutChanges(name, checkout);
+    else if (action === "reset") {
+      if (await resetCheckoutChanges(name, checkout)) return;
+    }
     else if (action === "push") await pushCheckoutChanges(name, checkout);
   }
 }
@@ -1163,6 +1168,31 @@ async function pushCheckoutChanges(name: string, checkout: CheckoutRecord): Prom
     const refreshed = await refreshCheckout(name);
     if (refreshed) console.log(`Status ${checkoutStatus(refreshed)}`);
   });
+}
+
+async function resetCheckoutChanges(name: string, checkout: CheckoutRecord): Promise<boolean> {
+  let confirmed: boolean;
+  try {
+    confirmed = await confirmPrompt({
+      message: `Discard all uncommitted changes in ${name}?`,
+      default: false,
+    });
+  } catch (err) {
+    if (isBackSignal(err)) return false;
+    throw err;
+  }
+
+  if (!confirmed) return false;
+
+  await runCommand(`Reset ${name}`, async () => {
+    const reset = await git(checkout.path, ["reset", "--hard", "HEAD"]);
+    printProcessOutput(reset);
+    const clean = await git(checkout.path, ["clean", "-fd"]);
+    printProcessOutput(clean);
+    const refreshed = await refreshCheckout(name);
+    if (refreshed) console.log(`Status ${checkoutStatus(refreshed)}`);
+  });
+  return true;
 }
 
 async function printGitSection(repoPath: string, label: string, args: string[]): Promise<void> {

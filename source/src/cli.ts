@@ -79,7 +79,7 @@ program
   .command("checkout")
   .description("Create a disposable checkout under /repo/checkouts")
   .argument("<repo>", '"owner/name" or "name"')
-  .option("--branch <branch>", "branch to checkout (default: repo default branch)")
+  .option("--branch <branch>", "existing branch to checkout (default: create vibing/YYYY-MM-DD from repo default branch)")
   .option("--name <name>", "checkout registry name and default directory name")
   .option("--path <path>", "custom checkout path")
   .action(async (repo: string, opts: { branch?: string; name?: string; path?: string }) => {

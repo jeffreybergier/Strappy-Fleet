@@ -61,21 +61,24 @@ export async function createCheckout(opts: CreateCheckoutOptions): Promise<Creat
   if (state.checkouts[name]) throw new Error(`Checkout name "${name}" is already registered.`);
   await assertTargetAvailable(target);
 
-  const branch = opts.branch?.trim() || repo.defaultBranch;
+  const requestedBranch = opts.branch?.trim();
+  const baseBranch = requestedBranch || repo.defaultBranch;
+  const checkoutBranch = requestedBranch || defaultCheckoutBranchName();
   const remoteUrl = githubRemoteUrl(repo);
 
   await fs.mkdir(path.dirname(target), { recursive: true });
-  await execa("git", ["clone", "--branch", branch, mirror, target]);
+  await execa("git", ["clone", "--branch", baseBranch, mirror, target]);
   await git(target, ["remote", "set-url", "origin", remoteUrl]);
   await git(target, ["config", "strappy.repo", repo.fullName]);
   await git(target, ["config", "strappy.checkoutName", name]);
-  await setUpstreamIfPossible(target, branch);
+  if (!requestedBranch) await git(target, ["switch", "-c", checkoutBranch]);
+  await setUpstreamIfPossible(target, checkoutBranch);
 
   let record: CheckoutRecord = {
     repo: repo.fullName,
     path: target,
     createdAt: new Date().toISOString(),
-    branch,
+    branch: checkoutBranch,
     mode: "github",
     remoteUrl,
     lastScan: null,
@@ -264,6 +267,17 @@ function defaultCheckoutName(records: RepoRecord[], repo: RepoRecord): string {
   const [owner, name] = splitFullName(repo.fullName);
   const duplicateNames = records.filter((r) => r.fullName.split("/")[1] === name).length > 1;
   return duplicateNames ? `${owner}--${name}` : name;
+}
+
+function defaultCheckoutBranchName(date = new Date()): string {
+  return `vibing/${formatLocalDate(date)}`;
+}
+
+function formatLocalDate(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 function validateCheckoutName(name: string): void {
