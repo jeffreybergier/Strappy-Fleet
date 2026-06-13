@@ -6,7 +6,7 @@ services:
     environment:
       - IS_SANDBOX=1
     volumes:
-      - ~/.strappy:/root
+      - ~/.altivec:/root
       - ./source:/repo/source
       - ./backups:/repo/backups
       - ./checkouts:/repo/checkouts
