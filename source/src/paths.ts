@@ -14,6 +14,7 @@ export interface Paths {
   secrets: string;
   tokenFile: string;
   mirrors: string;
+  environments: string;
   checkouts: string;
   logs: string;
   logFile: string;
@@ -40,6 +41,7 @@ export function getPaths(home: string = resolveHome()): Paths {
     secrets: path.join(home, "secrets"),
     tokenFile: path.join(home, "secrets", "github-token"),
     mirrors: path.join(home, "mirrors"),
+    environments: path.join(home, "environments"),
     checkouts: path.join(home, "checkouts"),
     logs: path.join(home, "logs"),
     logFile: path.join(home, "logs", "strappy.log"),

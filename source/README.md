@@ -35,6 +35,8 @@ first-pass TUI, and direct GitHub-origin checkout management.
   collide. A pre-existing `state.json` is imported automatically on first run.
 - The GitHub token is resolved from env / `secrets/github-token` / `gh` and is
   **never written into a mirror's git config**.
+- Repo-local environment files can be saved under `$STRAPPY_HOME/environments`
+  and restored into future disposable checkouts without committing them to Git.
 
 Also present now: a first-pass interactive TUI shell with a live auth/health
 dashboard, checkout-oriented repo search/actions, and integrated checkout
@@ -78,6 +80,10 @@ npm run strappy -- list                # list mirrors
 npm run strappy -- list --stale        # only stale mirrors
 npm run strappy -- list --orphaned     # repos gone from GitHub
 npm run strappy -- checkout repo       # clone into /repo/checkouts/repo on vibing/YYYY-MM-DD
+npm run strappy -- env save repo --from /path/to/checkout .env
+npm run strappy -- env list repo
+npm run strappy -- env restore repo --to /path/to/checkout
+npm run strappy -- checkout repo --env default
 npm run strappy -- checkouts           # scan dirty/unpushed status
 npm run strappy -- checkouts --dirty   # only dirty checkouts
 npm run strappy -- cleanup repo        # delete if clean and fully pushed
@@ -120,3 +126,18 @@ The `entrypoint` forwards anything after `strappy` to the CLI via `"$@"` (the
 trailing `bash` is `$0`). `--rm` removes the one-off container on exit;
 `./backups` and `./checkouts` are mounted, so mirrors and disposable working
 copies persist on the host between runs.
+
+## Environments
+
+Saved environment files live under a repo-relative tree:
+
+```text
+$STRAPPY_HOME/environments/<owner>/<repo>/<repo-relative-path>
+$STRAPPY_HOME/environments/.strappy/<owner>/<repo>.json
+```
+
+Only explicit repo-relative file paths are saved. Restore refuses unsafe paths,
+symlinks, and existing different target files unless `--overwrite` is passed.
+Files are restored with private permissions (`0600`, or `0700` for executable
+files). The hidden `.strappy` manifest directory is Strappy metadata; the
+`<owner>/<repo>` directory itself can be copied directly into a checkout.

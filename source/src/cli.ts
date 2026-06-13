@@ -6,6 +6,7 @@ import { checkoutCommand } from "./commands/checkout.js";
 import { checkoutsCommand } from "./commands/checkouts.js";
 import { cleanupCommand } from "./commands/cleanup.js";
 import { enrichCommand } from "./commands/enrich.js";
+import { envListCommand, envRestoreCommand, envSaveCommand } from "./commands/env.js";
 import { infoCommand } from "./commands/info.js";
 import { listCommand } from "./commands/list.js";
 import { scanCheckoutsCommand } from "./commands/scan-checkouts.js";
@@ -75,6 +76,43 @@ program
     await statusCommand(opts);
   });
 
+const envCommand = program
+  .command("env")
+  .description("Save, list, and restore repo environment files");
+
+envCommand
+  .command("save")
+  .description("Save selected repo-relative environment files into STRAPPY_HOME")
+  .argument("<repo>", '"owner/name" or "name"')
+  .argument("[paths...]", "repo-relative files to save")
+  .option("--from <path>", "checkout path to read from (default: current directory)")
+  .option("--profile <profile>", "environment profile name", "default")
+  .option("--path <path>", "repo-relative file to save (repeatable)", collectOption, [] as string[])
+  .action(async (repo: string, paths: string[], opts: { from?: string; profile?: string; path?: string[] }) => {
+    await envSaveCommand(repo, paths, opts);
+  });
+
+envCommand
+  .command("restore")
+  .description("Restore saved environment files into a checkout")
+  .argument("<repo>", '"owner/name" or "name"')
+  .option("--to <path>", "checkout path to restore into (default: current directory)")
+  .option("--profile <profile>", "environment profile name", "default")
+  .option("--path <path>", "repo-relative file to restore (repeatable)", collectOption, [] as string[])
+  .option("--overwrite", "replace existing different files")
+  .action(async (repo: string, opts: { to?: string; profile?: string; path?: string[]; overwrite?: boolean }) => {
+    await envRestoreCommand(repo, opts);
+  });
+
+envCommand
+  .command("list")
+  .description("List saved environment profiles")
+  .argument("[repo]", '"owner/name" or "name"')
+  .option("--json", "machine-readable output")
+  .action(async (repo: string | undefined, opts: { json?: boolean }) => {
+    await envListCommand(repo, opts);
+  });
+
 program
   .command("checkout")
   .description("Create a disposable checkout under /repo/checkouts")
@@ -82,7 +120,12 @@ program
   .option("--branch <branch>", "existing branch to checkout (default: create vibing/YYYY-MM-DD from repo default branch)")
   .option("--name <name>", "checkout registry name and default directory name")
   .option("--path <path>", "custom checkout path")
-  .action(async (repo: string, opts: { branch?: string; name?: string; path?: string }) => {
+  .option("--env <profile>", "restore saved environment profile after checkout")
+  .option("--env-overwrite", "allow --env to replace existing different files")
+  .action(async (
+    repo: string,
+    opts: { branch?: string; name?: string; path?: string; env?: string; envOverwrite?: boolean },
+  ) => {
     await checkoutCommand(repo, opts);
   });
 
@@ -130,3 +173,8 @@ program.parseAsync(process.argv).catch((err: unknown) => {
   process.stderr.write(`strappy: ${message}\n`);
   process.exitCode = 1;
 });
+
+function collectOption(value: string, previous: string[]): string[] {
+  previous.push(value);
+  return previous;
+}

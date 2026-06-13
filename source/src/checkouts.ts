@@ -3,6 +3,7 @@ import fsSync from "node:fs";
 import path from "node:path";
 import { execa } from "execa";
 import type { StrappyConfig } from "./config.js";
+import { restoreEnvironment, type RestoreEnvironmentResult } from "./environments.js";
 import { mirrorExists } from "./git.js";
 import { mirrorPath, splitFullName, type Paths } from "./paths.js";
 import type { CheckoutRecord, RepoRecord, Store, StrappyState } from "./state.js";
@@ -15,11 +16,14 @@ export interface CreateCheckoutOptions {
   branch?: string;
   name?: string;
   targetPath?: string;
+  environmentProfile?: string;
+  environmentOverwrite?: boolean;
 }
 
 export interface CreateCheckoutResult {
   name: string;
   record: CheckoutRecord;
+  environmentRestore: RestoreEnvironmentResult | null;
 }
 
 export interface CleanupResult {
@@ -74,6 +78,20 @@ export async function createCheckout(opts: CreateCheckoutOptions): Promise<Creat
   if (!requestedBranch) await git(target, ["switch", "-c", checkoutBranch]);
   await setUpstreamIfPossible(target, checkoutBranch);
 
+  const environmentRestore = opts.environmentProfile
+    ? await restoreEnvironment({
+        paths: opts.paths,
+        repo: repo.fullName,
+        profile: opts.environmentProfile,
+        checkoutPath: target,
+        overwrite: opts.environmentOverwrite,
+      })
+    : null;
+  if (environmentRestore?.refused.length) {
+    const details = environmentRestore.refused.map((refused) => `${refused.path}: ${refused.reason}`).join("; ");
+    throw new Error(`Environment restore refused ${environmentRestore.refused.length} file(s): ${details}`);
+  }
+
   let record: CheckoutRecord = {
     repo: repo.fullName,
     path: target,
@@ -98,7 +116,7 @@ export async function createCheckout(opts: CreateCheckoutOptions): Promise<Creat
     locked.checkouts[name] = record;
   });
 
-  return { name, record };
+  return { name, record, environmentRestore };
 }
 
 export async function scanCheckout(record: CheckoutRecord): Promise<CheckoutRecord> {
