@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
+import path from "node:path";
 import * as readline from "node:readline";
 import {
   createPrompt,
@@ -22,12 +23,23 @@ import {
   createCheckout,
   resolveCheckoutName,
   resolveCheckoutRoot,
+  resolveRepo,
+  scanCheckout,
   scanCheckouts,
   unsafeReason,
 } from "./checkouts.js";
 import { runFullSync } from "./commands/sync.js";
 import { loadConfig, type StrappyConfig } from "./config.js";
 import { openStore } from "./db.js";
+import {
+  listEnvironmentProfiles,
+  listEnvironmentRepositories,
+  readEnvironmentManifest,
+  restoreEnvironment,
+  saveEnvironment,
+  type EnvironmentProfileSummary,
+  type EnvironmentRepoSummary,
+} from "./environments.js";
 import { humanSize, timeAgo } from "./format.js";
 import { makeOctokit, whoami } from "./github.js";
 import { Logger } from "./logger.js";
@@ -37,6 +49,7 @@ import type { CheckoutRecord, RepoRecord, StrappyState } from "./state.js";
 type MainAction =
   | "sync"
   | "audit"
+  | "environments"
   | "checkout"
   | `checkout:${string}`;
 
@@ -49,6 +62,8 @@ type AuditAction =
   | "default-branch-not-main";
 
 type CheckoutWorkAction = "diff" | "commit" | "push" | "reset";
+
+type EnvironmentAction = "list" | "update" | "save" | "restore";
 
 interface Choice<Value> {
   value: Value;
@@ -235,6 +250,7 @@ export async function runTui(): Promise<void> {
 
       const action = result.action;
       if (action === "audit") await auditMenu();
+      else if (action === "environments") await environmentsMenu();
       else if (action === "checkout") await repoCheckoutSearchView();
       else if (action.startsWith("checkout:")) await handleCheckoutSelection(action.slice("checkout:".length));
     }
@@ -687,6 +703,7 @@ function mainMenuChoices(checkouts: [string, CheckoutRecord][]): Array<Choice<Ma
     menuSection("Actions"),
     { value: "sync", name: "Sync" },
     { value: "audit", name: "Audit" },
+    { value: "environments", name: "Environments" },
     { value: "checkout", name: "Checkout" },
     menuSection(checkouts.length ? "Checkouts" : "Checkouts (none)"),
   ];
@@ -984,6 +1001,310 @@ function printAuditRepoList(records: RepoRecord[]): void {
   for (const repo of records) console.log(repoListLine(repo, layout));
 }
 
+async function environmentsMenu(): Promise<void> {
+  while (true) {
+    const paths = getPaths();
+    const summaries = await listEnvironmentRepositories(paths);
+
+    clear();
+    title("Environments");
+    printEnvironmentSummaries(summaries);
+    console.log("");
+
+    let action: EnvironmentAction;
+    try {
+      action = await selectPrompt<EnvironmentAction>({
+        message: "Menu",
+        choices: [
+          { value: "list", name: "View Saved Secret Counts" },
+          { value: "update", name: "Update Saved Secrets From Checkout" },
+          { value: "save", name: "Save New Secret Path From Checkout" },
+          { value: "restore", name: "Restore Saved Secrets Into Checkout" },
+        ],
+      });
+    } catch (err) {
+      if (isBackSignal(err)) return;
+      throw err;
+    }
+
+    if (action === "list") await showEnvironmentSummary();
+    else if (action === "update") await updateEnvironmentFromCheckout();
+    else if (action === "save") await saveEnvironmentPathFromCheckout();
+    else if (action === "restore") await restoreEnvironmentIntoCheckout();
+  }
+}
+
+async function showEnvironmentSummary(): Promise<void> {
+  const summaries = await listEnvironmentRepositories(getPaths());
+  clear();
+  title("Saved Secrets");
+  printEnvironmentSummaries(summaries);
+  console.log("");
+  await pause();
+}
+
+function printEnvironmentSummaries(summaries: EnvironmentRepoSummary[]): void {
+  if (summaries.length === 0) {
+    console.log("No saved environments.");
+    return;
+  }
+
+  const repoWidth = Math.min(48, Math.max(...summaries.map((summary) => summary.repo.length)));
+  for (const summary of summaries) {
+    console.log(`${summary.repo.padEnd(repoWidth)}  ${String(summary.fileCount).padStart(3)} secret(s)`);
+  }
+  console.log(color.dim(`${summaries.length} repo(s).`));
+}
+
+interface EnvironmentCheckoutSource {
+  repo: string;
+  path: string;
+  label: string;
+  checkoutName: string | null;
+}
+
+async function updateEnvironmentFromCheckout(): Promise<void> {
+  const source = await chooseEnvironmentCheckoutSource("Update from checkout");
+  if (!source) return;
+  const clean = await requireCleanPushedCheckout(source);
+  if (!clean) return;
+
+  const paths = getPaths();
+  const profile = await chooseEnvironmentProfile(source.repo);
+  if (!profile) return;
+  const manifest = await readEnvironmentManifest(paths, source.repo, profile);
+  const confirmed = await confirmPrompt({
+    message: `Update ${manifest.files.length} saved secret(s) from ${source.label}?`,
+    default: true,
+  });
+  if (!confirmed) return;
+
+  await runCommand("Update Secrets", async () => {
+    const result = await saveEnvironment({
+      paths,
+      repo: source.repo,
+      profile,
+      checkoutPath: source.path,
+      filePaths: manifest.files.map((entry) => entry.path),
+    });
+    console.log(`Updated ${result.saved.length} secret(s) for ${source.repo}.`);
+  });
+}
+
+async function saveEnvironmentPathFromCheckout(): Promise<void> {
+  const source = await chooseEnvironmentCheckoutSource("Save from checkout");
+  if (!source) return;
+  const clean = await requireCleanPushedCheckout(source);
+  if (!clean) return;
+
+  let relPath: string;
+  try {
+    relPath = await inputPrompt({ message: "Repo-relative secret path" });
+  } catch (err) {
+    if (isBackSignal(err)) return;
+    throw err;
+  }
+
+  const trimmed = relPath.trim();
+  if (!trimmed) return;
+
+  const confirmed = await confirmPrompt({
+    message: `Save one secret path for ${source.repo}?`,
+    default: true,
+  });
+  if (!confirmed) return;
+
+  await runCommand("Save Secret", async () => {
+    const result = await saveEnvironment({
+      paths: getPaths(),
+      repo: source.repo,
+      profile: "default",
+      checkoutPath: source.path,
+      filePaths: [trimmed],
+    });
+    console.log(`Saved ${result.saved.length} secret(s) for ${source.repo}.`);
+  });
+}
+
+async function restoreEnvironmentIntoCheckout(): Promise<void> {
+  const source = await chooseEnvironmentCheckoutSource("Restore into checkout");
+  if (!source) return;
+
+  const profile = await chooseEnvironmentProfile(source.repo);
+  if (!profile) return;
+
+  const overwrite = await confirmPrompt({
+    message: "Overwrite existing different files?",
+    default: false,
+  });
+
+  await runCommand("Restore Secrets", async () => {
+    const result = await restoreEnvironment({
+      paths: getPaths(),
+      repo: source.repo,
+      profile,
+      checkoutPath: source.path,
+      overwrite,
+    });
+    console.log(`Restored ${result.restored.length} secret(s) for ${source.repo}.`);
+    if (result.unchanged.length) console.log(`${result.unchanged.length} secret(s) already matched.`);
+    if (result.refused.length) {
+      console.log(`${result.refused.length} secret(s) refused.`);
+      for (const refused of result.refused) console.log(`- ${refused.path}: ${refused.reason}`);
+    }
+  });
+}
+
+async function chooseEnvironmentCheckoutSource(message: string): Promise<EnvironmentCheckoutSource | null> {
+  const checkouts = await scanCheckoutEntries();
+  const choices: Array<Choice<string> | Separator> = [];
+  if (checkouts.length) {
+    const layout = checkoutListLayout(checkouts);
+    choices.push(checkoutMenuHeader(layout));
+    for (const [name, checkout] of checkouts) {
+      choices.push({
+        value: `checkout:${name}`,
+        name: checkoutMenuLine(name, checkout, layout),
+        short: name,
+      });
+    }
+    choices.push(menuSection("Other"));
+  }
+  choices.push({ value: "manual", name: "Manual checkout path" });
+
+  let selected: string;
+  try {
+    selected = await selectPrompt<string>({
+      message,
+      pageSize: 10,
+      choices,
+    });
+  } catch (err) {
+    if (isBackSignal(err)) return null;
+    throw err;
+  }
+
+  if (selected.startsWith("checkout:")) {
+    const name = selected.slice("checkout:".length);
+    const checkout = await refreshCheckout(name);
+    if (!checkout) return null;
+    return {
+      repo: checkout.repo,
+      path: checkout.path,
+      label: name,
+      checkoutName: name,
+    };
+  }
+
+  let checkoutPath: string;
+  let repoArg: string;
+  try {
+    checkoutPath = await inputPrompt({ message: "Checkout path" });
+    repoArg = await inputPrompt({ message: "Repo (owner/name or known repo name)" });
+  } catch (err) {
+    if (isBackSignal(err)) return null;
+    throw err;
+  }
+
+  const resolvedPath = path.resolve(checkoutPath.trim());
+  const repo = await resolveEnvironmentRepoForTui(repoArg.trim());
+  return {
+    repo,
+    path: resolvedPath,
+    label: resolvedPath,
+    checkoutName: null,
+  };
+}
+
+async function chooseEnvironmentProfile(repo: string): Promise<string | null> {
+  const profiles = await listEnvironmentProfiles(getPaths(), repo);
+  if (profiles.length === 0) {
+    clear();
+    title("No Saved Secrets");
+    console.log(`No saved secrets for ${repo}.`);
+    console.log("");
+    await pause();
+    return null;
+  }
+  if (profiles.length === 1) return profiles[0].profile;
+
+  try {
+    return await selectPrompt<string>({
+      message: "Profile",
+      choices: profiles.map((profile) => environmentProfileChoice(profile)),
+    });
+  } catch (err) {
+    if (isBackSignal(err)) return null;
+    throw err;
+  }
+}
+
+function environmentProfileChoice(profile: EnvironmentProfileSummary): Choice<string> {
+  return {
+    value: profile.profile,
+    name: `${profile.profile} (${profile.fileCount} secret(s))`,
+    short: profile.profile,
+  };
+}
+
+async function requireCleanPushedCheckout(source: EnvironmentCheckoutSource): Promise<CheckoutRecord | null> {
+  const scanned = source.checkoutName ? await refreshCheckout(source.checkoutName) : await scanStandaloneCheckout(source);
+  if (!scanned) return null;
+
+  const problem =
+    scanned.exists === false
+      ? `Checkout path does not exist: ${source.path}`
+      : scanned.scanError
+        ? `Checkout scan failed: ${scanned.scanError}`
+        : scanned.dirty
+          ? `Checkout is not clean: ${checkoutStatus(scanned)}`
+          : (scanned.ahead ?? 0) > 0
+            ? `Checkout has unpushed commits: ${checkoutStatus(scanned)}`
+            : null;
+
+  if (!problem) return scanned;
+
+  clear();
+  title("Checkout Not Ready");
+  console.log(problem);
+  console.log(color.dim("Commit and push the checkout before updating saved secrets."));
+  console.log("");
+  await pause();
+  return null;
+}
+
+async function scanStandaloneCheckout(source: EnvironmentCheckoutSource): Promise<CheckoutRecord> {
+  const record: CheckoutRecord = {
+    repo: source.repo,
+    path: source.path,
+    createdAt: new Date().toISOString(),
+    branch: "",
+    mode: "github",
+    remoteUrl: null,
+    lastScan: null,
+    exists: null,
+    dirty: null,
+    ahead: null,
+    behind: null,
+    currentBranch: null,
+    headSha: null,
+    upstream: null,
+    scanError: null,
+  };
+  return scanCheckout(record);
+}
+
+async function resolveEnvironmentRepoForTui(repoArg: string): Promise<string> {
+  const state = await openStore(getPaths()).read();
+  try {
+    return resolveRepo(Object.values(state.repos), repoArg).fullName;
+  } catch (err) {
+    if (!repoArg.includes("/")) throw err;
+    splitFullName(repoArg);
+    return repoArg;
+  }
+}
+
 function checkoutChoice(
   name: string,
   checkout: CheckoutRecord,
@@ -1075,19 +1396,42 @@ function fitText(value: string, width: number): string {
 async function createCheckoutFlow(repo: RepoRecord): Promise<boolean> {
   clear();
   title(`Checkout ${repoDisplayName(repo, true)}`);
-  console.log(color.dim("Creating checkout..."));
 
   try {
     const paths = getPaths();
     const config = await loadConfig(paths);
     const store = openStore(paths);
+    const profiles = await listEnvironmentProfiles(paths, repo.fullName);
+    let environmentProfile: string | undefined;
+
+    if (profiles.length > 0) {
+      console.log(`${profiles.reduce((count, profile) => count + profile.fileCount, 0)} saved secret(s) available.`);
+      const restoreSaved = await confirmPrompt({
+        message: "Restore saved secrets into checkout?",
+        default: true,
+      });
+      if (restoreSaved) {
+        environmentProfile = profiles.length === 1
+          ? profiles[0].profile
+          : await selectPrompt<string>({
+              message: "Profile",
+              choices: profiles.map((profile) => environmentProfileChoice(profile)),
+            });
+      }
+    }
+
+    clear();
+    title(`Checkout ${repoDisplayName(repo, true)}`);
+    console.log(color.dim("Creating checkout..."));
     await createCheckout({
       store,
       paths,
       config,
       repoArg: repo.fullName,
+      environmentProfile,
     });
   } catch (err) {
+    if (isBackSignal(err)) return false;
     clear();
     title(`Checkout ${repoDisplayName(repo, true)}`);
     const message = err instanceof Error ? err.message : String(err);

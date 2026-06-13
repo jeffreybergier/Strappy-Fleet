@@ -58,6 +58,13 @@ export interface EnvironmentProfileSummary {
   fileCount: number;
 }
 
+export interface EnvironmentRepoSummary {
+  repo: string;
+  path: string;
+  updatedAt: string | null;
+  fileCount: number;
+}
+
 interface StoredEnvironmentManifest {
   version: 2;
   repo: string;
@@ -206,6 +213,32 @@ export async function listEnvironmentProfiles(
   }
 
   return summaries.sort((a, b) => a.repo.localeCompare(b.repo) || a.profile.localeCompare(b.profile));
+}
+
+export async function listEnvironmentRepositories(
+  paths: Paths,
+  repo?: string,
+): Promise<EnvironmentRepoSummary[]> {
+  const manifests = repo
+    ? [await readStoredManifest(paths, validateRepo(repo), { allowMissing: true })]
+    : await listStoredManifests(paths);
+  const summaries: EnvironmentRepoSummary[] = [];
+
+  for (const stored of manifests) {
+    if (!stored) continue;
+    const filePaths = new Set<string>();
+    for (const profile of Object.values(stored.profiles)) {
+      for (const entry of profile.files) filePaths.add(entry.path);
+    }
+    summaries.push({
+      repo: stored.repo,
+      path: environmentRepoPath(paths, stored.repo),
+      updatedAt: stored.updatedAt || null,
+      fileCount: filePaths.size,
+    });
+  }
+
+  return summaries.sort((a, b) => a.repo.localeCompare(b.repo));
 }
 
 export async function readEnvironmentManifest(

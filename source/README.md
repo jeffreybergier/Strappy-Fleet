@@ -82,6 +82,7 @@ npm run strappy -- list --orphaned     # repos gone from GitHub
 npm run strappy -- checkout repo       # clone into /repo/checkouts/repo on vibing/YYYY-MM-DD
 npm run strappy -- env save repo --from /path/to/checkout .env
 npm run strappy -- env list repo
+npm run strappy -- env update repo --from /path/to/checkout
 npm run strappy -- env restore repo --to /path/to/checkout
 npm run strappy -- checkout repo --env default
 npm run strappy -- checkouts           # scan dirty/unpushed status
@@ -141,3 +142,10 @@ symlinks, and existing different target files unless `--overwrite` is passed.
 Files are restored with private permissions (`0600`, or `0700` for executable
 files). The hidden `.strappy` manifest directory is Strappy metadata; the
 `<owner>/<repo>` directory itself can be copied directly into a checkout.
+
+Use `strappy env list` to show each saved repo and its secret count. Use
+`strappy env update [repo] --from <checkout>` to refresh already-saved secret
+paths from a checkout; update refuses to run unless the checkout is clean and
+has no unpushed commits. Add new paths explicitly with `strappy env save`.
+The interactive TUI has the same environment workflows under `Environments`,
+and checkout creation prompts to restore saved secrets when the repo has any.

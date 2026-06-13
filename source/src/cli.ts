@@ -6,7 +6,7 @@ import { checkoutCommand } from "./commands/checkout.js";
 import { checkoutsCommand } from "./commands/checkouts.js";
 import { cleanupCommand } from "./commands/cleanup.js";
 import { enrichCommand } from "./commands/enrich.js";
-import { envListCommand, envRestoreCommand, envSaveCommand } from "./commands/env.js";
+import { envListCommand, envRestoreCommand, envSaveCommand, envUpdateCommand } from "./commands/env.js";
 import { infoCommand } from "./commands/info.js";
 import { listCommand } from "./commands/list.js";
 import { scanCheckoutsCommand } from "./commands/scan-checkouts.js";
@@ -105,11 +105,23 @@ envCommand
   });
 
 envCommand
+  .command("update")
+  .description("Refresh saved environment files from a clean, fully pushed checkout")
+  .argument("[repo]", '"owner/name" or "name" (default: infer from checkout)')
+  .option("--from <path>", "checkout path to read from (default: current directory)")
+  .option("--profile <profile>", "environment profile name", "default")
+  .option("--path <path>", "already-saved repo-relative file to update (repeatable)", collectOption, [] as string[])
+  .action(async (repo: string | undefined, opts: { from?: string; profile?: string; path?: string[] }) => {
+    await envUpdateCommand(repo, opts);
+  });
+
+envCommand
   .command("list")
-  .description("List saved environment profiles")
+  .description("List saved environment repositories")
   .argument("[repo]", '"owner/name" or "name"')
+  .option("--profiles", "show profile-level details")
   .option("--json", "machine-readable output")
-  .action(async (repo: string | undefined, opts: { json?: boolean }) => {
+  .action(async (repo: string | undefined, opts: { json?: boolean; profiles?: boolean }) => {
     await envListCommand(repo, opts);
   });
 
