@@ -135,14 +135,14 @@ Saved environment files live under a repo-relative tree:
 
 ```text
 $STRAPPY_HOME/environments/<owner>/<repo>/<repo-relative-path>
-$STRAPPY_HOME/environments/.strappy/<owner>/<repo>.json
 ```
 
 Only explicit repo-relative file paths are saved. Restore refuses unsafe paths,
 symlinks, and existing different target files unless `--overwrite` is passed.
 Files are restored with private permissions (`0600`, or `0700` for executable
-files). The hidden `.strappy` manifest directory is Strappy metadata; the
-`<owner>/<repo>` directory itself can be copied directly into a checkout.
+files). The `<owner>/<repo>` directory is the source of truth and can be edited
+directly; Strappy rebuilds its saved secret list by scanning this tree when
+listing environments, including when the TUI opens `Environments`.
 
 Use `strappy env list` to show each saved repo and its secret count. Use
 `strappy env update [repo] --from <checkout>` to refresh already-saved secret

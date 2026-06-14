@@ -77,6 +77,8 @@ interface StoredEnvironmentProfile {
   files: EnvironmentFileEntry[];
 }
 
+const DEFAULT_ENVIRONMENT_PROFILE = "default";
+
 export async function saveEnvironment(opts: SaveEnvironmentOptions): Promise<SaveEnvironmentResult> {
   const repo = validateRepo(opts.repo);
   const profile = validateProfile(opts.profile);
@@ -84,9 +86,8 @@ export async function saveEnvironment(opts: SaveEnvironmentOptions): Promise<Sav
   const relPaths = uniqueNormalizedPaths(opts.filePaths);
   if (relPaths.length === 0) throw new Error("Choose at least one environment file path to save.");
 
-  const stored = (await readStoredManifest(opts.paths, repo, { allowMissing: true })) ?? emptyStoredManifest(repo);
-  const existingProfile = stored.profiles[profile];
-  const entriesByPath = new Map((existingProfile?.files ?? []).map((entry) => [entry.path, entry]));
+  const existing = await readEnvironmentManifest(opts.paths, repo, profile, { allowMissing: true });
+  const entriesByPath = new Map((existing?.files ?? []).map((entry) => [entry.path, entry]));
   const savedAt = new Date().toISOString();
   const saved: EnvironmentFileEntry[] = [];
   const repoDir = environmentRepoPath(opts.paths, repo);
@@ -121,12 +122,6 @@ export async function saveEnvironment(opts: SaveEnvironmentOptions): Promise<Sav
     savedAt,
     files: [...entriesByPath.values()].sort((a, b) => a.path.localeCompare(b.path)),
   };
-  stored.updatedAt = savedAt;
-  stored.profiles[profile] = {
-    savedAt,
-    files: manifest.files,
-  };
-  await writeStoredManifest(opts.paths, stored);
   return { manifest, saved };
 }
 
@@ -142,7 +137,7 @@ export async function restoreEnvironment(opts: RestoreEnvironmentOptions): Promi
   const unchanged: EnvironmentFileEntry[] = [];
   const refused: { path: string; reason: string }[] = missing.map((rel) => ({
     path: rel,
-    reason: "not present in environment manifest",
+    reason: "not present in saved environment",
   }));
 
   for (const entry of entries) {
@@ -151,7 +146,7 @@ export async function restoreEnvironment(opts: RestoreEnvironmentOptions): Promi
     const target = safeJoin(checkoutRoot, rel);
     const sourceStat = await checkedStoredFile(source, rel);
     if (sourceStat.size !== entry.size || (await hashFile(source)) !== entry.sha256) {
-      refused.push({ path: rel, reason: "stored file no longer matches manifest" });
+      refused.push({ path: rel, reason: "stored file changed during restore" });
       continue;
     }
     const current = await existingTarget(target);
@@ -259,10 +254,10 @@ export async function readEnvironmentManifest(
   profile: string,
   opts: { allowMissing?: boolean } = {},
 ): Promise<EnvironmentManifest | null> {
+  const normalizedProfile = validateProfile(profile);
   const stored = await readStoredManifest(paths, repo, { allowMissing: opts.allowMissing ?? false });
   if (!stored) return null;
-  const normalizedProfile = validateProfile(profile);
-  const profileManifest = stored.profiles[normalizedProfile];
+  const profileManifest = stored.profiles[normalizedProfile] ?? stored.profiles[DEFAULT_ENVIRONMENT_PROFILE];
   if (!profileManifest && opts.allowMissing) return null;
   if (!profileManifest) throw new Error(`No saved environment for ${repo} profile "${profile}".`);
   return {
@@ -274,17 +269,8 @@ export async function readEnvironmentManifest(
   };
 }
 
-function emptyStoredManifest(repo: string): StoredEnvironmentManifest {
-  return {
-    version: 2,
-    repo,
-    updatedAt: new Date(0).toISOString(),
-    profiles: {},
-  };
-}
-
 async function listStoredManifests(paths: Paths): Promise<StoredEnvironmentManifest[]> {
-  const root = environmentManifestRoot(paths);
+  const root = paths.environments;
   const manifests: StoredEnvironmentManifest[] = [];
   let owners;
   try {
@@ -294,18 +280,18 @@ async function listStoredManifests(paths: Paths): Promise<StoredEnvironmentManif
     throw err;
   }
 
-  for (const owner of owners) {
-    if (!owner.isDirectory()) continue;
+  for (const owner of owners.sort((a, b) => a.name.localeCompare(b.name))) {
+    if (!owner.isDirectory() || owner.name.startsWith(".")) continue;
     const ownerRoot = path.join(root, owner.name);
     const entries = await fs.readdir(ownerRoot, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
-      const stored = await readStoredManifestFile(path.join(ownerRoot, entry.name));
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+      const stored = await readStoredManifest(paths, `${owner.name}/${entry.name}`, { allowMissing: true });
       if (stored) manifests.push(stored);
     }
   }
 
-  return manifests;
+  return manifests.sort((a, b) => a.repo.localeCompare(b.repo));
 }
 
 async function readStoredManifest(
@@ -313,49 +299,24 @@ async function readStoredManifest(
   repo: string,
   opts: { allowMissing?: boolean } = {},
 ): Promise<StoredEnvironmentManifest | null> {
-  const manifestPath = environmentManifestPath(paths, validateRepo(repo));
-  const stored = await readStoredManifestFile(manifestPath);
-  if (!stored && opts.allowMissing) return null;
-  if (!stored) throw new Error(`No saved environments for ${repo}.`);
-  return stored;
-}
-
-async function readStoredManifestFile(manifestPath: string): Promise<StoredEnvironmentManifest | null> {
-  let raw: string;
-  try {
-    raw = await fs.readFile(manifestPath, "utf8");
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw err;
+  const normalizedRepo = validateRepo(repo);
+  const files = await scanStoredEnvironmentFiles(environmentRepoPath(paths, normalizedRepo));
+  if (!files || files.length === 0) {
+    if (opts.allowMissing) return null;
+    throw new Error(`No saved environments for ${normalizedRepo}.`);
   }
-
-  const parsed = JSON.parse(raw) as Partial<StoredEnvironmentManifest>;
-  if (parsed.version !== 2) throw new Error(`Unsupported environment manifest version in ${manifestPath}.`);
-  if (!parsed.repo || !parsed.profiles || typeof parsed.profiles !== "object") {
-    throw new Error(`Invalid environment manifest: ${manifestPath}`);
-  }
-
-  const profiles: Record<string, StoredEnvironmentProfile> = {};
-  for (const [profile, profileManifest] of Object.entries(parsed.profiles)) {
-    profiles[validateProfile(profile)] = {
-      savedAt: profileManifest.savedAt,
-      files: profileManifest.files.map(normalizeManifestEntry).sort((a, b) => a.path.localeCompare(b.path)),
-    };
-  }
-
+  const updatedAt = latestEntrySavedAt(files);
   return {
     version: 2,
-    repo: validateRepo(parsed.repo),
-    updatedAt: parsed.updatedAt ?? "",
-    profiles,
+    repo: normalizedRepo,
+    updatedAt,
+    profiles: {
+      [DEFAULT_ENVIRONMENT_PROFILE]: {
+        savedAt: updatedAt,
+        files,
+      },
+    },
   };
-}
-
-async function writeStoredManifest(paths: Paths, manifest: StoredEnvironmentManifest): Promise<void> {
-  const manifestPath = environmentManifestPath(paths, manifest.repo);
-  await fs.mkdir(path.dirname(manifestPath), { recursive: true });
-  await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
-  await fs.chmod(manifestPath, 0o600);
 }
 
 function environmentRepoPath(paths: Paths, repo: string): string {
@@ -363,27 +324,53 @@ function environmentRepoPath(paths: Paths, repo: string): string {
   return path.join(paths.environments, owner, name);
 }
 
-function environmentManifestRoot(paths: Paths): string {
-  return path.join(paths.environments, ".strappy");
-}
-
-function environmentManifestPath(paths: Paths, repo: string): string {
-  const [owner, name] = splitFullName(validateRepo(repo));
-  return path.join(environmentManifestRoot(paths), owner, `${name}.json`);
-}
-
-function normalizeManifestEntry(entry: Partial<EnvironmentFileEntry>): EnvironmentFileEntry {
-  if (!entry.path || !entry.mode || !entry.sha256 || typeof entry.size !== "number") {
-    throw new Error("Invalid environment manifest file entry.");
+async function scanStoredEnvironmentFiles(repoDir: string): Promise<EnvironmentFileEntry[] | null> {
+  let rootStat: Stats;
+  try {
+    rootStat = await fs.lstat(repoDir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
   }
+  if (rootStat.isSymbolicLink()) throw new Error(`Stored environment path is a symlink: ${repoDir}`);
+  if (!rootStat.isDirectory()) throw new Error(`Stored environment path is not a directory: ${repoDir}`);
+  return (await scanStoredEnvironmentFilesIn(repoDir, repoDir)).sort((a, b) => a.path.localeCompare(b.path));
+}
+
+async function scanStoredEnvironmentFilesIn(root: string, current: string): Promise<EnvironmentFileEntry[]> {
+  const entries = await fs.readdir(current, { withFileTypes: true });
+  const files: EnvironmentFileEntry[] = [];
+
+  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    const absolute = path.join(current, entry.name);
+    const rel = path.relative(root, absolute).split(path.sep).join("/");
+    if (entry.isSymbolicLink()) throw new Error(`Stored environment path is a symlink: ${rel}`);
+    if (entry.isDirectory()) {
+      if (entry.name === ".git") throw new Error(`Stored environment path cannot target .git: ${rel}`);
+      files.push(...(await scanStoredEnvironmentFilesIn(root, absolute)));
+      continue;
+    }
+    if (!entry.isFile()) throw new Error(`Stored environment path is not a file: ${rel}`);
+    files.push(await storedEnvironmentEntry(absolute, rel));
+  }
+
+  return files;
+}
+
+async function storedEnvironmentEntry(source: string, rel: string): Promise<EnvironmentFileEntry> {
+  const sourceStat = await checkedStoredFile(source, rel);
   return {
-    path: validateRelativePath(entry.path),
-    mode: formatMode(parseMode(entry.mode)),
-    size: entry.size,
-    sha256: entry.sha256,
-    savedAt: entry.savedAt ?? "",
-    sourceCheckout: entry.sourceCheckout ?? null,
+    path: validateRelativePath(rel),
+    mode: formatMode(restoreModeFromSource(sourceStat.mode)),
+    size: sourceStat.size,
+    sha256: await hashFile(source),
+    savedAt: sourceStat.mtime.toISOString(),
+    sourceCheckout: null,
   };
+}
+
+function latestEntrySavedAt(files: EnvironmentFileEntry[]): string {
+  return files.reduce((latest, entry) => entry.savedAt > latest ? entry.savedAt : latest, "");
 }
 
 async function checkedSourceFile(source: string, rel: string): Promise<{ mode: number; size: number }> {
@@ -393,11 +380,11 @@ async function checkedSourceFile(source: string, rel: string): Promise<{ mode: n
   return { mode: stat.mode, size: stat.size };
 }
 
-async function checkedStoredFile(source: string, rel: string): Promise<{ size: number }> {
+async function checkedStoredFile(source: string, rel: string): Promise<{ mode: number; size: number; mtime: Date }> {
   const stat = await fs.lstat(source);
   if (stat.isSymbolicLink()) throw new Error(`Stored environment file is a symlink: ${rel}`);
   if (!stat.isFile()) throw new Error(`Stored environment path is not a file: ${rel}`);
-  return { size: stat.size };
+  return { mode: stat.mode, size: stat.size, mtime: stat.mtime };
 }
 
 async function existingTarget(target: string): Promise<Stats | null> {
