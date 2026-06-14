@@ -4,15 +4,15 @@ services:
     stdin_open: true
     tty: true
     env_file:
-      - ~/Developer/zStrappy-Fleet/.env
+      - ~/Developer/Strappy-Fleet/.env
     environment:
       - IS_SANDBOX=1
     volumes:
       - ~/.altivec:/root
-      - ~/Developer/zStrappy-Fleet/AGENTS.md:/repo/AGENTS.md
-      - ~/Developer/zStrappy-Fleet/skills:/repo/skills
-      - ~/Developer/zStrappy-Fleet/source:/repo/strappy-fleet
-      - ~/Developer/zBackups:/repo/backups
+      - ~/Developer/Strappy-Fleet/AGENTS.md:/repo/AGENTS.md
+      - ~/Developer/Strappy-Fleet/skills:/repo/skills
+      - ~/Developer/Strappy-Fleet/source:/repo/strappy-fleet
+      - ~/Developer/Backups:/repo/backups
       - ~/Developer/Vibing:/repo/checkouts
     working_dir: /repo
     entrypoint: /bin/bash
@@ -23,11 +23,11 @@ services:
     stdin_open: true
     tty: true
     env_file:
-      - ~/Developer/zStrappy-Fleet/.env
+      - ~/Developer/Strappy-Fleet/.env
     volumes:
       - ~/.altivec:/root
-      - ~/Developer/zStrappy-Fleet/source:/repo/strappy-fleet
-      - ~/Developer/zBackups:/repo/backups
+      - ~/Developer/Strappy-Fleet/source:/repo/strappy-fleet
+      - ~/Developer/Backups:/repo/backups
       - ~/Developer/Vibing:/repo/checkouts
     working_dir: /repo/strappy-fleet
     entrypoint: /bin/bash -lc 'npm install --no-fund --no-audit --loglevel=error >/dev/null && exec npm run --silent strappy -- "$@"' bash
