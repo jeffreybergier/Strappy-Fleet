@@ -61,7 +61,7 @@ type AuditAction =
   | "main-unprotected"
   | "default-branch-not-main";
 
-type CheckoutWorkAction = "diff" | "commit" | "push" | "reset";
+type CheckoutWorkAction = "diff" | "commit" | "reset";
 
 type EnvironmentAction = "list" | "update" | "save" | "restore";
 
@@ -1267,7 +1267,7 @@ async function requireCleanPushedCheckout(source: EnvironmentCheckoutSource): Pr
   clear();
   title("Checkout Not Ready");
   console.log(problem);
-  console.log(color.dim("Commit and push the checkout before updating saved secrets."));
+  console.log(color.dim("Commit and push the checkout from your local shell before updating saved secrets."));
   console.log("");
   await pause();
   return null;
@@ -1380,7 +1380,7 @@ function maxTextLength(values: string[]): number {
 function checkoutStatusLabel(checkout: CheckoutRecord): string {
   if (checkout.exists === false) return "missing";
   if (checkout.scanError) return "warning";
-  if (checkout.dirty && (checkout.ahead ?? 0) > 0) return "dirty+push";
+  if (checkout.dirty && (checkout.ahead ?? 0) > 0) return "dirty+unpushed";
   if (checkout.dirty) return "dirty";
   if ((checkout.ahead ?? 0) > 0) return `${checkout.ahead} unpushed`;
   if ((checkout.behind ?? 0) > 0) return `${checkout.behind} behind`;
@@ -1510,11 +1510,14 @@ async function checkoutWorkMenu(name: string): Promise<void> {
 
     const canDiff = checkout.dirty === true;
     const canCommit = checkout.dirty === true;
-    const canPush = (checkout.ahead ?? 0) > 0;
     const canReset = checkout.dirty === true;
 
-    if (!canDiff && !canCommit && !canPush) {
-      console.log(color.dim("No local diff or unpushed commits available."));
+    if (!canDiff && !canCommit) {
+      if ((checkout.ahead ?? 0) > 0) {
+        console.log(color.dim("Checkout has unpushed commits. Push from your local shell using SSH credentials."));
+      } else {
+        console.log(color.dim("No local diff available."));
+      }
       await pause();
       return;
     }
@@ -1527,7 +1530,6 @@ async function checkoutWorkMenu(name: string): Promise<void> {
           { value: "diff", name: "Diff", disabled: canDiff ? false : "(no changes)" },
           { value: "commit", name: "Commit", disabled: canCommit ? false : "(no changes)" },
           { value: "reset", name: "Reset", disabled: canReset ? false : "(no changes)" },
-          { value: "push", name: "Push", disabled: canPush ? false : "(nothing to push)" },
         ],
       });
     } catch (err) {
@@ -1540,7 +1542,6 @@ async function checkoutWorkMenu(name: string): Promise<void> {
     else if (action === "reset") {
       if (await resetCheckoutChanges(name, checkout)) return;
     }
-    else if (action === "push") await pushCheckoutChanges(name, checkout);
   }
 }
 
@@ -1567,16 +1568,6 @@ async function commitCheckoutChanges(name: string, checkout: CheckoutRecord): Pr
   await runCommand(`Commit ${name}`, async () => {
     await git(checkout.path, ["add", "-A"]);
     const result = await git(checkout.path, ["commit", "-m", trimmed], 60_000);
-    printProcessOutput(result);
-    const refreshed = await refreshCheckout(name);
-    if (refreshed) console.log(`Status ${checkoutStatus(refreshed)}`);
-  });
-}
-
-async function pushCheckoutChanges(name: string, checkout: CheckoutRecord): Promise<void> {
-  await runCommand(`Push ${name}`, async () => {
-    const args = checkout.upstream ? ["push"] : ["push", "-u", "origin", "HEAD"];
-    const result = await git(checkout.path, args, 120_000);
     printProcessOutput(result);
     const refreshed = await refreshCheckout(name);
     if (refreshed) console.log(`Status ${checkoutStatus(refreshed)}`);

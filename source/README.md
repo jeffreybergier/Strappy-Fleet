@@ -44,8 +44,9 @@ workflows, a first-pass audit menu for repo hygiene, plus a repo-local
 Codex skill at `skills/strappy-fleet` for AI-assisted SQLite/CLI workflows. The
 daemon, durable audit findings, repo profiles, and deeper AI integration are
 still future work. Relay push is intentionally not part of the current checkout flow:
-checkouts use GitHub as `origin`, so normal `git push` works with your existing
-Git credentials.
+checkouts use GitHub SSH remotes and Strappy never fetches, pulls, or pushes
+them. Use your host shell for checkout network operations; the TUI only reads
+the local checkout state already present on disk.
 
 ## Setup
 

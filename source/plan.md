@@ -147,24 +147,31 @@ Default checkout path:
 2. Ensure the mirror exists and is fresh enough, fetching if online.
 3. Clone from the local mirror into the checkout root.
 4. Create a new work branch named `vibing/YYYY-MM-DD` from the repo default
-   branch unless the user passed `--branch`.
-5. Set `origin` to GitHub so normal `git push` uses the user's existing Git
-   credentials.
+   branch unless the user passed `--branch`. Set upstream only when a same-named
+   remote-tracking branch already exists; new unpublished branches honestly have
+   no upstream.
+5. Set `origin` to GitHub SSH for both fetch and push. Strappy does not fetch,
+   pull, or push checkouts; host-side Git handles checkout network operations.
 6. Register the checkout in SQLite.
-7. Run the first checkout scan immediately.
+7. Run the first local-only checkout scan immediately.
 
 Relay push is deliberately deferred. It may come back later as an optional
 advanced mode, but the current product should keep checkouts understandable:
-clone fast from the local mirror, then push directly to GitHub.
+clone fast from the local mirror, then let the host shell fetch, pull, and push
+directly to GitHub.
 
 ### Status Model
 
 A checkout is safe to delete only when all of these are false:
 
 - dirty working tree: `git status --porcelain=v1` has output
-- local commits not pushed to the mirror: `git log --branches --not --remotes`
+- local commits not present in local remote-tracking refs: `git log --branches --not --remotes`
   has output
 - local commits are not reachable from any remote-tracking ref
+
+Checkout scans never contact the network. `behind` and `unpushed` status reflect
+the local remote-tracking refs already present in the checkout; run `git fetch`
+from the host shell when you need fresher status.
 
 Track three separate concepts in the UI:
 
@@ -313,7 +320,7 @@ Guardrails:
 
 ## 7. TUI Proposal
 
-The TUI should optimize for repeated operations: scan, compare, checkout, push,
+The TUI should optimize for repeated operations: scan, compare, checkout,
 cleanup, and audit. Avoid a marketing-style home screen; open directly into the
 fleet dashboard.
 

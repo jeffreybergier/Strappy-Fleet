@@ -29,7 +29,7 @@ export interface CheckoutRecord {
   path: string;
   createdAt: string;
   branch: string;
-  /** `github` is the normal direct-push flow; `local` is retained for escape hatches/tests. */
+  /** `github` means a host-managed GitHub checkout; `local` is retained for escape hatches/tests. */
   mode: "github" | "local";
   remoteUrl: string | null;
   lastScan: string | null;

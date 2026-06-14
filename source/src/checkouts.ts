@@ -68,7 +68,7 @@ export async function createCheckout(opts: CreateCheckoutOptions): Promise<Creat
   const requestedBranch = opts.branch?.trim();
   const baseBranch = requestedBranch || repo.defaultBranch;
   const checkoutBranch = requestedBranch || defaultCheckoutBranchName();
-  const remoteUrl = githubRemoteUrl(repo);
+  const remoteUrl = githubSshRemoteUrl(repo);
 
   await fs.mkdir(path.dirname(target), { recursive: true });
   await execa("git", ["clone", "--branch", baseBranch, mirror, target]);
@@ -149,12 +149,6 @@ export async function scanCheckout(record: CheckoutRecord): Promise<CheckoutReco
   }
 
   const errors: string[] = [];
-  try {
-    await git(record.path, ["fetch", "--quiet", "--prune", "origin"], 20_000);
-  } catch (err) {
-    errors.push(`fetch failed: ${errorMessage(err)}`);
-  }
-
   try {
     const status = await gitOut(record.path, ["status", "--porcelain=v1"]);
     next.dirty = status.trim().length > 0;
@@ -318,13 +312,16 @@ async function assertTargetAvailable(target: string): Promise<void> {
   }
 }
 
-function githubRemoteUrl(repo: RepoRecord): string {
+function githubSshRemoteUrl(repo: RepoRecord): string {
+  const metadataUrl = repo.metadata?.sshUrl;
+  if (metadataUrl) return metadataUrl;
+
   const raw = repo.raw;
   if (typeof raw === "object" && raw !== null) {
-    const cloneUrl = (raw as { clone_url?: unknown }).clone_url;
-    if (typeof cloneUrl === "string" && cloneUrl) return cloneUrl;
+    const sshUrl = (raw as { ssh_url?: unknown }).ssh_url;
+    if (typeof sshUrl === "string" && sshUrl) return sshUrl;
   }
-  return `https://github.com/${repo.fullName}.git`;
+  return `git@github.com:${repo.fullName}.git`;
 }
 
 async function setUpstreamIfPossible(repoPath: string, branch: string): Promise<void> {
