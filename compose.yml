@@ -22,10 +22,23 @@ services:
     tty: true
     env_file:
       - ~/Developer/Strappy-Fleet/.env
+    environment:
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: "*"
+      npm_config_cache: /repo/strappy-fleet/source/node_modules/.npm-cache
     volumes:
       - ~/.altivec:/root
       - ~/Developer/Strappy-Fleet:/repo/strappy-fleet
       - ~/Developer/Backups:/repo/backups
       - ~/Developer/Vibing:/repo/checkouts
+      - strappy_npm:/repo/strappy-fleet/source/node_modules
     working_dir: /repo/strappy-fleet/source
-    entrypoint: /bin/bash -lc 'npm install --no-fund --no-audit --loglevel=error >/dev/null && exec npm run --silent strappy -- "$@"' bash
+    entrypoint:
+      - /bin/bash
+      - -lc
+      - git config --global --replace-all safe.directory "*" && export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$$PATH" CC=/usr/bin/gcc CXX=/usr/bin/g++ LD=/usr/bin/ld AR=/usr/bin/ar && npm install --no-fund --no-audit --loglevel=error >/dev/null && exec npm run --silent strappy -- "$$@"
+      - bash
+
+volumes:
+  strappy_npm:
