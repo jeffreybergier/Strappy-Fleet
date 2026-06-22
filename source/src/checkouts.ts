@@ -76,6 +76,7 @@ export async function createCheckout(opts: CreateCheckoutOptions): Promise<Creat
   await git(target, ["config", "strappy.repo", repo.fullName]);
   await git(target, ["config", "strappy.checkoutName", name]);
   if (!requestedBranch) await git(target, ["switch", "-c", checkoutBranch]);
+  await git(target, ["submodule", "update", "--init", "--recursive"], 120_000);
   await setUpstreamIfPossible(target, checkoutBranch);
 
   const environmentRestore = opts.environmentProfile
